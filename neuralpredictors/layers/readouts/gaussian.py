@@ -411,9 +411,6 @@ class FullGaussian2d(Readout):
         else:
             raise NotImplementedError(f"Regularizer_type {self._regularizer_type} is not implemented")
 
-    def regularizer(self, reduction="sum", average=None):
-        return self.feature_l1(reduction=reduction, average=average) * self.feature_reg_weight
-
     @property
     def mu(self):
         if self._predicted_grid:
