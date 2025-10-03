@@ -13,6 +13,7 @@ class FiringRateEncoder(Encoder):
         core,
         readout,
         *,
+        perspective=None,
         shifter=None,
         modulator=None,
         elu_offset=0.0,
@@ -34,6 +35,7 @@ class FiringRateEncoder(Encoder):
         super().__init__()
         self.core = core
         self.readout = readout
+        self.perspective = perspective
         self.shifter = shifter
         self.modulator = modulator
         self.offset = elu_offset
@@ -63,7 +65,18 @@ class FiringRateEncoder(Encoder):
         detach_core=False,
         **kwargs
     ):
-        x = self.core(inputs)
+        x = inputs
+
+        if self.perspective:
+            if self.shifter:
+                raise ValueError("both perspective and shifter cannot be present together, only one should be chosen")
+            
+            if pupil_center is None:
+                raise ValueError("pupil_center is not given")
+            
+            x = self.perspective[data_key](x, pupil_center)
+
+        x = self.core(x)
         if detach_core:
             x = x.detach()
 
