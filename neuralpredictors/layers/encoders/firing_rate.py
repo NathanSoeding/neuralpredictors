@@ -68,8 +68,12 @@ class FiringRateEncoder(Encoder):
         x = inputs
 
         if self.perspective:
+            if self.shifter:
+                raise ValueError("both perspective and shifter cannot be present together, only one should be chosen")
+            
             if pupil_center is None:
                 raise ValueError("pupil_center is not given")
+            
             x = self.perspective[data_key](x, pupil_center)
 
         x = self.core(x)

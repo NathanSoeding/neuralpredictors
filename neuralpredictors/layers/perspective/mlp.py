@@ -1,8 +1,22 @@
+'''
+code is adjusted from the Wang et al 2025 "Foundation model of neural activity predicts response to new stimulus types" implementation
+Specifically
+* https://github.com/cajal/fnn/blob/main/fnn/model/pixels.py
+* https://github.com/cajal/fnn/blob/main/fnn/model/perspectives.py
+'''
 import torch
 from torch import nn
 
-
 def angles_to_rmat3d(angles):
+    """
+    Convert batches of Euler angles (x, y, z) to 3D rotation matrices.
+
+    Args:
+        angles (torch.Tensor): Tensor of shape (N, 3), angles in radians.
+
+    Returns:
+        torch.Tensor: Tensor of shape (N, 3, 3), rotation matrices (Rz * Ry * Rx).
+    """
     x, y, z = torch.unbind(angles, axis=-1)
     N = len(x)
 
@@ -38,6 +52,9 @@ def angles_to_rmat3d(angles):
 
 
 class PixelTransform(nn.Module):
+    """
+    Nonlinear pixel intensity transform with learnable power, scale, and offset.
+    """
     def __init__(self, max_power=1, init_scale=1, init_offset=0, eps=1e-5):
         super().__init__()
 
@@ -54,21 +71,23 @@ class PixelTransform(nn.Module):
 
     def forward(self, pixels):
         return pixels.add(self.eps).pow(self.power).mul(self.scale).add(self.offset)
-
-
-class Scale(nn.Module):
-    def __init__(self, gamma):
-        super().__init__()
-        self.gamma = gamma
-
-    def forward(self, x):
-        return x * self.gamma
-
+    
 
 class Retina(nn.Module):
+    """
+    Models a retina that maps pupil centers to 3D rays via an MLP.
+
+    Args:
+        degree (float): Field of view in degrees.
+        height, width (int): Retina grid resolution.
+        dim_in, dim_out (int): Input/output dimensions for MLP.
+        mlp_features (int): Hidden feature size.
+        mlp_layers (int): Number of MLP layers.
+        max_angle (float): Maximum rotation angle in degrees.
+    """
     def __init__(
         self,
-        degree=75,
+        degree=50,
         height=36,
         width=64,
         dim_in=2,
@@ -148,6 +167,11 @@ class Retina(nn.Module):
 
 
 class Monitor(nn.Module):
+    """
+    Models a monitor in 3D space with optimizable position and orientation.
+
+    Provides projection of retinal rays onto the monitor plane and sampling of images.
+    """
     def __init__(
         self,
         init_center_x=0,
@@ -235,6 +259,9 @@ class Monitor(nn.Module):
 
 
 class SinglePerspective(nn.Module):
+    """
+    Combines Retina, Monitor, and PixelTransform to generate a single visual perspective.
+    """
     def __init__(self, retina, monitor, pixel_transform, static_power=1.7):
         super().__init__()
 
@@ -263,6 +290,9 @@ class SinglePerspective(nn.Module):
 
 
 class Perspective(nn.ModuleDict):
+    """
+    Container for multiple SinglePerspective modules keyed by dataset identifiers.
+    """
     def __init__(self, data_keys, retina_degree=75, mlp_features=16, mlp_layers=3):
         super().__init__()
 
