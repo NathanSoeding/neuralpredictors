@@ -1,4 +1,5 @@
 import warnings
+from functools import partial
 from typing import Sequence
 
 import numpy as np
@@ -279,11 +280,15 @@ class FullGaussian2d(Readout):
         return_weighted_features=False,
         regularizer_type="l1",
         gamma_sigma=0.1,
+        bottleneck=None,
+        whitener=None,
         **kwargs,
     ) -> None:
         super().__init__()
         self.feature_reg_weight = self.resolve_deprecated_gamma_readout(feature_reg_weight, gamma_readout, default=1.0)
         self.mean_activity = mean_activity
+        self.bottleneck = bottleneck
+        self.whitener = whitener
         # determines whether the Gaussian is isotropic or not
         self.gauss_type = gauss_type
         self._regularizer_type = regularizer_type
@@ -393,7 +398,14 @@ class FullGaussian2d(Readout):
 
     def adaptive_feature_l1_lognorm(self, reduction="sum", average=None):
         if self._original_features:
-            features = self.adaptive_neuron_reg_coefs.abs() * self.features
+            if self.bottleneck is not None:
+                features = self.bottleneck.embed_neurons(self.features.squeeze(2)).permute(2, 0, 1)
+            elif self.whitener is not None:
+                features = self.whitener.whiten_readouts(self.features)
+            else:
+                features = self.features
+            features = self.adaptive_neuron_reg_coefs.abs() * features
+            
             features_regularization = (
                 self.apply_reduction(features.abs(), reduction=reduction, average=average) * self.feature_reg_weight
             )
@@ -577,6 +589,8 @@ class FullGaussian2d(Readout):
         c_in, h_in, w_in = self.in_shape
         if (c_in, h_in, w_in) != (c, h, w):
             warnings.warn("the specified feature map dimension is not the readout's expected input dimension")
+        # feat = self.whitener.whiten_readouts(self.features).view(1, c, self.outdims)
+        # bias = self.bias + self.features.squeeze().T @ self.whitener.mu_ema.squeeze()
         feat = self.features.view(1, c, self.outdims)
         bias = self.bias
         outdims = self.outdims
@@ -601,12 +615,21 @@ class FullGaussian2d(Readout):
         if shift is not None:
             grid = grid + shift[:, None, None, :]
 
-        y = F.grid_sample(x, grid, align_corners=self.align_corners)
-        y = (y.squeeze(-1) * feat).sum(1).view(bs, outdims)
+        if self.bottleneck is not None:
+            readout_pos_sample = partial(F.grid_sample, grid=grid, align_corners=self.align_corners)
+            y, y_vec = self.bottleneck(x, readout_pos_sample, feat)
+        else:
+            y_vec = F.grid_sample(x, grid, align_corners=self.align_corners)
+
+            if self.whitener is not None:
+                # y_vec = self.whitener(y_vec) 
+                _ = self.whitener(y_vec)
+
+            y = (y_vec.squeeze(-1) * feat).sum(1).view(bs, outdims)
 
         if self.bias is not None:
             y = y + bias
-        return y
+        return y, y_vec
 
     def __repr__(self):
         c, h, w = self.in_shape

@@ -63,6 +63,7 @@ class FiringRateEncoder(Encoder):
         trial_idx=None,
         shift=None,
         detach_core=False,
+        return_vec=False,
         **kwargs
     ):
         x = inputs
@@ -77,6 +78,7 @@ class FiringRateEncoder(Encoder):
             x = self.perspective[data_key](x, pupil_center)
 
         x = self.core(x)
+
         if detach_core:
             x = x.detach()
 
@@ -86,7 +88,7 @@ class FiringRateEncoder(Encoder):
                 raise ValueError("pupil_center is not given")
             shift = self.shifter[data_key](pupil_center, trial_idx)
 
-        x = self.readout(x, data_key=data_key, shift=shift, **kwargs)
+        x, vec = self.readout(x, data_key=data_key, shift=shift, **kwargs)
         x = x[None, ...] if len(x.shape) == 1 else x  # keep dimensions if only one image was passed
 
         if self.modulator:
@@ -95,7 +97,10 @@ class FiringRateEncoder(Encoder):
             x = self.modulator[data_key](x, behavior=behavior)
 
         if self.nonlinearity_type == "elu":
-            return self.nonlinearity_fn(x + self.offset) + 1
+            if return_vec:
+                return self.nonlinearity_fn(x + self.offset) + 1, vec
+            else:
+                return self.nonlinearity_fn(x + self.offset) + 1
         else:
             return self.nonlinearity_fn(x)
 
