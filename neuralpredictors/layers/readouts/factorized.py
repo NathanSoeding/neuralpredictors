@@ -61,6 +61,9 @@ class FullFactorized2d(Readout):
         gamma_readout=None,
         temperature=None,
         factorize_spatial=False,
+        regularizer_type="l1",
+        gamma_sigma=0.1,
+        whitener=None,
         **kwargs,
     ):
         """
@@ -91,6 +94,17 @@ class FullFactorized2d(Readout):
         self.constrain_pos = constrain_pos
         self.positive_spatial = positive_spatial
         self.factorize_spatial = factorize_spatial
+        self.whitener = whitener
+        self._regularizer_type = regularizer_type
+
+        if self._regularizer_type == "adaptive_log_norm":
+            self.gamma_sigma = gamma_sigma
+            self.adaptive_neuron_reg_coefs = torch.nn.Parameter(
+                torch.normal(mean=torch.ones(outdims, 1), std=torch.ones(outdims, 1))
+            )
+        elif self._regularizer_type != "l1":
+            raise ValueError(f"regularizer_type should be 'l1' or 'adaptive_log_norm' but got {self._regularizer_type}")
+
         if positive_spatial and constrain_pos:
             warnings.warn(
                 f"If both positive_spatial and constrain_pos are True, "
@@ -173,8 +187,19 @@ class FullFactorized2d(Readout):
             weight = self.spatial
         return weight
 
-    def regularizer(self, reduction="sum", average=None):
-        return self.l1(reduction=reduction, average=average)
+    def adaptive_feature_l1_lognorm(self, reduction="sum", average=None):
+        if self.whitener is not None:
+            features = self.whitener.whiten_readouts(self.features)
+        else:
+            features = self.features
+        features = self.adaptive_neuron_reg_coefs.abs() * features
+        
+        features_regularization = (
+            self.apply_reduction(features.abs(), reduction=reduction, average=average) * self.feature_reg_weight
+        )
+        # adaptive_neuron_reg_coefs (betas) are supposted to be from lognorm distribution
+        coef_prior = 1 / (self.gamma_sigma**2) * ((torch.log(self.adaptive_neuron_reg_coefs.abs()) ** 2).sum())
+        return features_regularization + coef_prior
 
     def l1(self, reduction="sum", average=None):
         reduction = self.resolve_reduction_method(reduction=reduction, average=average)
@@ -185,11 +210,17 @@ class FullFactorized2d(Readout):
         c, h, w = self.in_shape
         ret = (
             self.spatial.view(self.outdims, -1).abs().sum(dim=1, keepdim=True) * self.spatial_reg_weight
-            + self.features.view(self.outdims, -1).abs().sum(dim=1) * self.feature_reg_weight
+            #+ self.features.view(self.outdims, -1).abs().sum(dim=1) * self.feature_reg_weight
         ).sum()
         if reduction == "mean":
             ret = ret / (n * c * w * h)
         return ret
+
+    def regularizer(self, reduction="sum", average=None):
+        return (
+            self.adaptive_feature_l1_lognorm(reduction=reduction, average=average)
+            + self.l1(reduction=reduction, average=average)
+        )
 
     def initialize(self, mean_activity=None):
         """
