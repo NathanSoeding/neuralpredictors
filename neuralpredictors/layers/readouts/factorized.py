@@ -3,9 +3,41 @@ import warnings
 import numpy as np
 import torch
 from torch import nn as nn
+from torch.nn import functional as F
 
 from .base import Readout
 
+
+def shift_feature_maps(x, shifts):
+    """
+    x:      (B, C, H, W)
+    shifts: (B, 2) in normalized coords [-1,1]
+
+    returns:
+        shifted x: (B, C, H, W)
+    """
+
+    B, C, H, W = x.shape
+    device = x.device
+
+    ys = torch.linspace(-1, 1, H, device=device)
+    xs = torch.linspace(-1, 1, W, device=device)
+
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    base_grid = torch.stack((xx, yy), dim=-1)  # (H,W,2)
+
+    sampling_grid = (
+        base_grid[None]
+        - shifts[:, None, None]
+    )  # (B,H,W,2)
+
+    return F.grid_sample(
+        x,
+        sampling_grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
 
 class FullFactorized2d(Readout):
     """
@@ -24,8 +56,11 @@ class FullFactorized2d(Readout):
         positive_spatial=False,
         shared_features=None,
         mean_activity=None,
-        spatial_and_feature_reg_weight=None,
+        spatial_reg_weight=None,
+        feature_reg_weight=None,
         gamma_readout=None,
+        temperature=None,
+        factorize_spatial=False,
         **kwargs,
     ):
         """
@@ -55,6 +90,7 @@ class FullFactorized2d(Readout):
         self.positive_weights = positive_weights
         self.constrain_pos = constrain_pos
         self.positive_spatial = positive_spatial
+        self.factorize_spatial = factorize_spatial
         if positive_spatial and constrain_pos:
             warnings.warn(
                 f"If both positive_spatial and constrain_pos are True, "
@@ -63,13 +99,19 @@ class FullFactorized2d(Readout):
         self.init_noise = init_noise
         self.normalize = normalize
         self.mean_activity = mean_activity
-        self.spatial_and_feature_reg_weight = self.resolve_deprecated_gamma_readout(
-            spatial_and_feature_reg_weight, gamma_readout, default=1.0
+        self.spatial_reg_weight = spatial_reg_weight
+        self.feature_reg_weight = self.resolve_deprecated_gamma_readout(
+            feature_reg_weight, gamma_readout, default=1.0
         )
+        self.temperature = temperature
 
         self._original_features = True
         self.initialize_features(**(shared_features or {}))
-        self.spatial = nn.Parameter(torch.Tensor(self.outdims, h, w))
+        if self.factorize_spatial:
+            self.h_spatial = nn.Parameter(torch.Tensor(self.outdims, h, 1))
+            self.w_spatial = nn.Parameter(torch.Tensor(self.outdims, 1, w))
+        else:
+            self.full_spatial = nn.Parameter(torch.Tensor(self.outdims, h, w))
 
         if bias:
             bias = nn.Parameter(torch.Tensor(outdims))
@@ -78,6 +120,19 @@ class FullFactorized2d(Readout):
             self.register_parameter("bias", None)
 
         self.initialize()
+
+    @property
+    def spatial(self):
+        if self.factorize_spatial:
+            h = self.h_spatial.shape[1]
+            w = self.w_spatial.shape[2]
+            spatial = (
+                self.h_spatial.expand(self.outdims, h, w) 
+                * self.w_spatial.expand(self.outdims, h, w)
+            )
+            return spatial
+        else:
+            return self.full_spatial
 
     @property
     def shared_features(self):
@@ -103,20 +158,23 @@ class FullFactorized2d(Readout):
         """
         Normalize the spatial mask
         """
-        if self.normalize:
-            norm = self.spatial.pow(2).sum(dim=1, keepdim=True)
-            norm = norm.sum(dim=2, keepdim=True).sqrt().expand_as(self.spatial) + 1e-6
-            weight = self.spatial / norm
-        else:
-            weight = self.spatial
+        weight = self.spatial
         if self.constrain_pos:
             weight.data.clamp_min_(0)
         elif self.positive_spatial:
             weight = torch.abs(weight)
+        if self.normalize:
+            # norm = weight.abs().sum(dim=1, keepdim=True)
+            # norm = norm.sum(dim=2, keepdim=True).expand_as(self.spatial) + 1e-6
+            # weight = weight / norm
+            o, w, h = weight.shape
+            weight = nn.functional.softmax(weight.view(o, w * h) / self.temperature, dim=1).view(o, w, h)
+        else:
+            weight = self.spatial
         return weight
 
     def regularizer(self, reduction="sum", average=None):
-        return self.l1(reduction=reduction, average=average) * self.spatial_and_feature_reg_weight
+        return self.l1(reduction=reduction, average=average)
 
     def l1(self, reduction="sum", average=None):
         reduction = self.resolve_reduction_method(reduction=reduction, average=average)
@@ -126,8 +184,8 @@ class FullFactorized2d(Readout):
         n = self.outdims
         c, h, w = self.in_shape
         ret = (
-            self.normalized_spatial.view(self.outdims, -1).abs().sum(dim=1, keepdim=True)
-            * self.features.view(self.outdims, -1).abs().sum(dim=1)
+            self.spatial.view(self.outdims, -1).abs().sum(dim=1, keepdim=True) * self.spatial_reg_weight
+            + self.features.view(self.outdims, -1).abs().sum(dim=1) * self.feature_reg_weight
         ).sum()
         if reduction == "mean":
             ret = ret / (n * c * w * h)
@@ -139,7 +197,11 @@ class FullFactorized2d(Readout):
         """
         if mean_activity is None:
             mean_activity = self.mean_activity
-        self.spatial.data.normal_(0, self.init_noise)
+        if self.factorize_spatial:
+            self.h_spatial.data.normal_(0, self.init_noise)
+            self.w_spatial.data.normal_(0, self.init_noise)
+        else:
+            self.full_spatial.data.normal_(0, self.init_noise)
         self._features.data.normal_(0, self.init_noise)
         if self._shared_features:
             self.scales.data.fill_(1.0)
@@ -177,8 +239,8 @@ class FullFactorized2d(Readout):
             self._shared_features = False
 
     def forward(self, x, shift=None, **kwargs):
-        if shift is not None:
-            raise NotImplementedError("shift is not implemented for this readout")
+        # if shift is not None:
+        #     raise NotImplementedError("shift is not implemented for this readout")
         if self.constrain_pos:
             self.features.data.clamp_min_(0)
 
@@ -187,11 +249,15 @@ class FullFactorized2d(Readout):
         if (c_in, w_in, h_in) != (c, w, h):
             raise ValueError("the specified feature map dimension is not the readout's expected input dimension")
 
-        y = torch.einsum("ncwh,owh->nco", x, self.normalized_spatial)
-        y = torch.einsum("nco,oc->no", y, self.features)
+
+        if shift is not None:
+            x = shift_feature_maps(x, shift)
+
+        y_vec = torch.einsum("ncwh,owh->nco", x, self.normalized_spatial)
+        y = torch.einsum("nco,oc->no", y_vec, self.features)
         if self.bias is not None:
             y = y + self.bias
-        return y
+        return y, y_vec
 
     def __repr__(self):
         c, h, w = self.in_shape
