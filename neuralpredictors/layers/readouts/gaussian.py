@@ -589,10 +589,12 @@ class FullGaussian2d(Readout):
         c_in, h_in, w_in = self.in_shape
         if (c_in, h_in, w_in) != (c, h, w):
             warnings.warn("the specified feature map dimension is not the readout's expected input dimension")
-        # feat = self.whitener.whiten_readouts(self.features).view(1, c, self.outdims)
-        # bias = self.bias + self.features.squeeze().T @ self.whitener.mu_ema.squeeze()
-        feat = self.features.view(1, c, self.outdims)
-        bias = self.bias
+        if not self.training:
+            feat = self.whitener.whiten_readouts(self.features).view(1, c, self.outdims)
+            bias = self.bias + self.features.squeeze().T @ self.whitener.mu_ema.squeeze()
+        else:
+            feat = self.features.view(1, c, self.outdims)
+            bias = self.bias
         outdims = self.outdims
 
         if self.batch_sample:
@@ -622,9 +624,10 @@ class FullGaussian2d(Readout):
             y_vec = F.grid_sample(x, grid, align_corners=self.align_corners)
 
             if self.whitener is not None:
-                # y_vec = self.whitener(y_vec) 
-                _ = self.whitener(y_vec)
-
+                whitened = self.whitener(y_vec)
+                if not self.training:
+                    y_vec = whitened
+                
             y = (y_vec.squeeze(-1) * feat).sum(1).view(bs, outdims)
 
         if self.bias is not None:
