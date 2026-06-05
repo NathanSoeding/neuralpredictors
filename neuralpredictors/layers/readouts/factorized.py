@@ -8,6 +8,50 @@ from torch.nn import functional as F
 from .base import Readout
 
 
+class RetinotopySpatial(nn.Module):
+    def __init__(self, source_grid, out_shape, factorize_spatial, hidden_features=20, hidden_layers=0):
+        super().__init__()
+
+        source_grid = source_grid - source_grid.mean(axis=0, keepdims=True)
+        source_grid = source_grid / np.abs(source_grid).max()
+        self.register_buffer("source_grid", torch.from_numpy(source_grid.astype(np.float32)))
+        self.out_shape = out_shape
+        self.factorize_spatial = factorize_spatial
+
+        def get_mlp(out_dim):
+            in_dim = source_grid.shape[1]
+            layers = []
+            for hidden_dim in [hidden_features] * hidden_layers:
+                layers.append(nn.Linear(in_dim, hidden_dim))
+                layers.append(nn.ELU())
+                in_dim = hidden_dim
+            layers.append(nn.Linear(in_dim, out_dim))
+            return nn.Sequential(*layers)
+
+        n, h, w = self.out_shape
+        if self.factorize_spatial:
+            self.h_mlp = get_mlp(h)
+            self.w_mlp = get_mlp(w)
+        else:
+            self.mlp = get_mlp(h * w)
+
+    def forward(self):
+        n, h, w = self.out_shape
+        
+        if self.factorize_spatial:
+            h_spatial = self.h_mlp(self.source_grid).unsqueeze(2)
+            w_spatial = self.w_mlp(self.source_grid).unsqueeze(1)
+        
+            spatial = (
+                h_spatial.expand(n, h, w) 
+                * w_spatial.expand(n, h, w)
+            )
+        else:
+            spatial = self.mlp(self.source_grid).view(n, h, w)
+        
+        return spatial
+
+
 def shift_feature_maps(x, shifts):
     """
     x:      (B, C, H, W)
@@ -63,6 +107,8 @@ class FullFactorized2d(Readout):
         factorize_spatial=False,
         regularizer_type="l1",
         gamma_sigma=0.1,
+        source_grid=None,
+        retinotopy_spatial=None,
         whitener=None,
         **kwargs,
     ):
@@ -121,11 +167,17 @@ class FullFactorized2d(Readout):
 
         self._original_features = True
         self.initialize_features(**(shared_features or {}))
-        if self.factorize_spatial:
-            self.h_spatial = nn.Parameter(torch.Tensor(self.outdims, h, 1))
-            self.w_spatial = nn.Parameter(torch.Tensor(self.outdims, 1, w))
+
+        if retinotopy_spatial is None:
+            self._retinotopy = False
+            if self.factorize_spatial:
+                self.h_spatial = nn.Parameter(torch.Tensor(self.outdims, h, 1))
+                self.w_spatial = nn.Parameter(torch.Tensor(self.outdims, 1, w))
+            else:
+                self.full_spatial = nn.Parameter(torch.Tensor(self.outdims, h, w))
         else:
-            self.full_spatial = nn.Parameter(torch.Tensor(self.outdims, h, w))
+            self._retinotopy = True
+            self.retinotopy_spatial = RetinotopySpatial(source_grid, (self.outdims, h, w), self.factorize_spatial, **retinotopy_spatial)
 
         if bias:
             bias = nn.Parameter(torch.Tensor(outdims))
@@ -137,16 +189,19 @@ class FullFactorized2d(Readout):
 
     @property
     def spatial(self):
-        if self.factorize_spatial:
-            h = self.h_spatial.shape[1]
-            w = self.w_spatial.shape[2]
-            spatial = (
-                self.h_spatial.expand(self.outdims, h, w) 
-                * self.w_spatial.expand(self.outdims, h, w)
-            )
-            return spatial
+        if self._retinotopy:
+            return self.retinotopy_spatial()
         else:
-            return self.full_spatial
+            if self.factorize_spatial:
+                h = self.h_spatial.shape[1]
+                w = self.w_spatial.shape[2]
+                spatial = (
+                    self.h_spatial.expand(self.outdims, h, w) 
+                    * self.w_spatial.expand(self.outdims, h, w)
+                )
+                return spatial
+            else:
+                return self.full_spatial
 
     @property
     def shared_features(self):
@@ -181,8 +236,8 @@ class FullFactorized2d(Readout):
             # norm = weight.abs().sum(dim=1, keepdim=True)
             # norm = norm.sum(dim=2, keepdim=True).expand_as(self.spatial) + 1e-6
             # weight = weight / norm
-            o, w, h = weight.shape
-            weight = nn.functional.softmax(weight.view(o, w * h) / self.temperature, dim=1).view(o, w, h)
+            o, h, w = weight.shape
+            weight = nn.functional.softmax(weight.view(o, h * w) / self.temperature, dim=1).view(o, h, w)
         else:
             weight = self.spatial
         return weight
@@ -228,11 +283,12 @@ class FullFactorized2d(Readout):
         """
         if mean_activity is None:
             mean_activity = self.mean_activity
-        if self.factorize_spatial:
-            self.h_spatial.data.normal_(0, self.init_noise)
-            self.w_spatial.data.normal_(0, self.init_noise)
-        else:
-            self.full_spatial.data.normal_(0, self.init_noise)
+        if not self._retinotopy:
+            if self.factorize_spatial:
+                self.h_spatial.data.normal_(0, self.init_noise)
+                self.w_spatial.data.normal_(0, self.init_noise)
+            else:
+                self.full_spatial.data.normal_(0, self.init_noise)
         self._features.data.normal_(0, self.init_noise)
         if self._shared_features:
             self.scales.data.fill_(1.0)
@@ -279,7 +335,6 @@ class FullFactorized2d(Readout):
         c_in, h_in, w_in = self.in_shape
         if (c_in, w_in, h_in) != (c, w, h):
             raise ValueError("the specified feature map dimension is not the readout's expected input dimension")
-
 
         if shift is not None:
             x = shift_feature_maps(x, shift)
