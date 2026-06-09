@@ -1,5 +1,6 @@
 import warnings
 
+import math
 import numpy as np
 import torch
 from torch import nn as nn
@@ -51,6 +52,62 @@ class RetinotopySpatial(nn.Module):
         
         return spatial
 
+def real_fourier_basis(H, W, max_freq):
+    y = torch.arange(H)
+    x = torch.arange(W)
+    Y, X = torch.meshgrid(y, x, indexing="ij")
+
+    basis = []
+    for u in range(-max_freq, max_freq + 1):
+        for v in range(-max_freq, max_freq + 1):
+            phase = 2 * torch.pi * (
+                u * Y  + v * X 
+            ) / max(H, W)
+
+            # also get rid of cosine for 0, 0 as we use softmax which is logit shift invariant
+            if not (u == 0 and v == 0):
+                basis.append(torch.cos(phase))
+                basis.append(torch.sin(phase))
+
+    basis = torch.stack(basis)
+    mask = torch.zeros(basis.shape[0], dtype=bool)
+    for i in range(basis.shape[0]):
+        repeat = (basis[i, None] == basis[mask]).all(dim=(1, 2)).any()
+        inverse = (basis[i, None] == -basis[mask]).all(dim=(1, 2)).any()
+
+        if not repeat and not inverse:
+            mask[i] = True
+    return basis[mask]
+
+class FourierRetinotopy(nn.Module):
+    def __init__(self, source_grid, out_shape, max_freq=3, hidden_features=20, hidden_layers=0):
+        super().__init__()
+
+        source_grid = source_grid - source_grid.mean(axis=0, keepdims=True)
+        source_grid = source_grid / np.abs(source_grid).max()
+        self.register_buffer("source_grid", torch.from_numpy(source_grid.astype(np.float32)))
+        self.out_shape = out_shape
+
+        n, h, w = self.out_shape
+        self.register_buffer("basis", real_fourier_basis(h, w, max_freq))
+        k = self.basis.shape[0]
+
+        in_dim = source_grid.shape[1]
+        layers = []
+        for hidden_dim in [hidden_features] * hidden_layers:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.ELU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, k))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self):
+        k = self.basis.shape[0]
+        coeffs = self.mlp(self.source_grid)  # n, k
+        logits = torch.einsum("nk,khw->nhw", coeffs, self.basis) / math.sqrt(k)
+
+        return logits
+    
 
 def shift_feature_maps(x, shifts):
     """
@@ -175,9 +232,16 @@ class FullFactorized2d(Readout):
                 self.w_spatial = nn.Parameter(torch.Tensor(self.outdims, 1, w))
             else:
                 self.full_spatial = nn.Parameter(torch.Tensor(self.outdims, h, w))
-        else:
+        elif retinotopy_spatial['type'] == 'direct':
+            retinotopy_config = retinotopy_spatial.copy()
+            del retinotopy_config['type']
             self._retinotopy = True
-            self.retinotopy_spatial = RetinotopySpatial(source_grid, (self.outdims, h, w), self.factorize_spatial, **retinotopy_spatial)
+            self.retinotopy_spatial = RetinotopySpatial(source_grid, (self.outdims, h, w), self.factorize_spatial, **retinotopy_config)
+        elif retinotopy_spatial['type'] == 'fourier':
+            retinotopy_config = retinotopy_spatial.copy()
+            del retinotopy_config['type']
+            self._retinotopy = True
+            self.retinotopy_spatial = FourierRetinotopy(source_grid, (self.outdims, h, w), **retinotopy_config)
 
         if bias:
             bias = nn.Parameter(torch.Tensor(outdims))
