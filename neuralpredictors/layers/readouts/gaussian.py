@@ -366,7 +366,10 @@ class FullGaussian2d(Readout):
         if self._shared_features:
             return self.scales * self._features[..., self.feature_sharing_index]
         else:
-            return self._features
+            if (self.whitener is not None) and (not self.training):
+                return self.whitener.whiten_readouts(self._features).view(1, -1, self.outdims)
+            else:
+                return self._features
 
     @property
     def grid(self):
@@ -589,11 +592,10 @@ class FullGaussian2d(Readout):
         c_in, h_in, w_in = self.in_shape
         if (c_in, h_in, w_in) != (c, h, w):
             warnings.warn("the specified feature map dimension is not the readout's expected input dimension")
-        if not self.training:
-            feat = self.whitener.whiten_readouts(self.features).view(1, c, self.outdims)
+        feat = self.features.view(1, c, self.outdims)
+        if (self.whitener is not None) and (not self.training):
             bias = self.bias + self.features.squeeze().T @ self.whitener.mu_ema.squeeze()
         else:
-            feat = self.features.view(1, c, self.outdims)
             bias = self.bias
         outdims = self.outdims
 

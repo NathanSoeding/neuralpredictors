@@ -166,6 +166,8 @@ class FullFactorized2d(Readout):
         gamma_sigma=0.1,
         source_grid=None,
         retinotopy_spatial=None,
+        fourier_spatial=True,
+        fourier_max_freq=4,
         whitener=None,
         **kwargs,
     ):
@@ -225,23 +227,29 @@ class FullFactorized2d(Readout):
         self._original_features = True
         self.initialize_features(**(shared_features or {}))
 
-        if retinotopy_spatial is None:
+        if retinotopy_spatial is None and not fourier_spatial:
             self._retinotopy = False
+            self._fourier = False
             if self.factorize_spatial:
                 self.h_spatial = nn.Parameter(torch.Tensor(self.outdims, h, 1))
                 self.w_spatial = nn.Parameter(torch.Tensor(self.outdims, 1, w))
             else:
                 self.full_spatial = nn.Parameter(torch.Tensor(self.outdims, h, w))
-        elif retinotopy_spatial['type'] == 'direct':
-            retinotopy_config = retinotopy_spatial.copy()
-            del retinotopy_config['type']
+        elif retinotopy_spatial is None and fourier_spatial:
+            self._retinotopy = False
+            self._fourier = True
+            self.register_buffer("basis", real_fourier_basis(h, w, fourier_max_freq))
+            k = self.basis.shape[0]
+            self.coeffs = nn.Parameter(torch.Tensor(self.outdims, k))
+            print('fourier coeffs shape:', self.coeffs.shape)
+        elif retinotopy_spatial is not None and not fourier_spatial:
             self._retinotopy = True
-            self.retinotopy_spatial = RetinotopySpatial(source_grid, (self.outdims, h, w), self.factorize_spatial, **retinotopy_config)
-        elif retinotopy_spatial['type'] == 'fourier':
-            retinotopy_config = retinotopy_spatial.copy()
-            del retinotopy_config['type']
+            self._fourier = False
+            self.retinotopy_spatial = RetinotopySpatial(source_grid, (self.outdims, h, w), self.factorize_spatial, **retinotopy_spatial)
+        elif retinotopy_spatial is not None and fourier_spatial:
             self._retinotopy = True
-            self.retinotopy_spatial = FourierRetinotopy(source_grid, (self.outdims, h, w), **retinotopy_config)
+            self._fourier = True
+            self.retinotopy_spatial = FourierRetinotopy(source_grid, (self.outdims, h, w), fourier_max_freq, **retinotopy_spatial)
 
         if bias:
             bias = nn.Parameter(torch.Tensor(outdims))
@@ -256,7 +264,11 @@ class FullFactorized2d(Readout):
         if self._retinotopy:
             return self.retinotopy_spatial()
         else:
-            if self.factorize_spatial:
+            if self._fourier:
+                k = self.basis.shape[0]
+                logits = torch.einsum("nk,khw->nhw", self.coeffs, self.basis) / math.sqrt(k)
+                return logits
+            elif self.factorize_spatial:
                 h = self.h_spatial.shape[1]
                 w = self.w_spatial.shape[2]
                 spatial = (
@@ -302,13 +314,12 @@ class FullFactorized2d(Readout):
             # weight = weight / norm
             o, h, w = weight.shape
             weight = nn.functional.softmax(weight.view(o, h * w) / self.temperature, dim=1).view(o, h, w)
-        else:
-            weight = self.spatial
+    
         return weight
 
     def adaptive_feature_l1_lognorm(self, reduction="sum", average=None):
         if self.whitener is not None:
-            features = self.whitener.whiten_readouts(self.features)
+            features = self.whitener.whiten_readouts(self.features.T).squeeze().T
         else:
             features = self.features
         features = self.adaptive_neuron_reg_coefs.abs() * features
@@ -329,7 +340,6 @@ class FullFactorized2d(Readout):
         c, h, w = self.in_shape
         ret = (
             self.spatial.view(self.outdims, -1).abs().sum(dim=1, keepdim=True) * self.spatial_reg_weight
-            #+ self.features.view(self.outdims, -1).abs().sum(dim=1) * self.feature_reg_weight
         ).sum()
         if reduction == "mean":
             ret = ret / (n * c * w * h)
@@ -348,7 +358,9 @@ class FullFactorized2d(Readout):
         if mean_activity is None:
             mean_activity = self.mean_activity
         if not self._retinotopy:
-            if self.factorize_spatial:
+            if self._fourier:
+                self.coeffs.data.normal_(0, self.init_noise)
+            elif self.factorize_spatial:
                 self.h_spatial.data.normal_(0, self.init_noise)
                 self.w_spatial.data.normal_(0, self.init_noise)
             else:
@@ -404,6 +416,11 @@ class FullFactorized2d(Readout):
             x = shift_feature_maps(x, shift)
 
         y_vec = torch.einsum("ncwh,owh->nco", x, self.normalized_spatial)
+        if self.whitener is not None:
+            _ = self.whitener(y_vec).squeeze()
+            # if not self.training:
+            #     y_vec = whitened
+            
         y = torch.einsum("nco,oc->no", y_vec, self.features)
         if self.bias is not None:
             y = y + self.bias
