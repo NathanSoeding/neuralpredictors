@@ -80,7 +80,7 @@ def real_fourier_basis(H, W, max_freq):
     return basis[mask]
 
 class FourierRetinotopy(nn.Module):
-    def __init__(self, source_grid, out_shape, max_freq=3, hidden_features=20, hidden_layers=0):
+    def __init__(self, source_grid, out_shape, max_freq=3, hidden_features=20, hidden_layers=0, in_dim=None):
         super().__init__()
 
         source_grid = source_grid - source_grid.mean(axis=0, keepdims=True)
@@ -92,7 +92,8 @@ class FourierRetinotopy(nn.Module):
         self.register_buffer("basis", real_fourier_basis(h, w, max_freq))
         k = self.basis.shape[0]
 
-        in_dim = source_grid.shape[1]
+        in_dim = source_grid.shape[1] if in_dim is None else in_dim
+        self.inp_dim = in_dim
         layers = []
         for hidden_dim in [hidden_features] * hidden_layers:
             layers.append(nn.Linear(in_dim, hidden_dim))
@@ -101,11 +102,19 @@ class FourierRetinotopy(nn.Module):
         layers.append(nn.Linear(in_dim, k))
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self):
+    def forward(self, pupil_center=None):
         k = self.basis.shape[0]
-        coeffs = self.mlp(self.source_grid)  # n, k
+        if pupil_center is not None:
+            n, _ = self.source_grid.shape
+            combined = torch.cat([
+                self.source_grid, 
+                pupil_center.unsqueeze(0).expand(n, -1),
+            ], dim=-1)    
+            coeffs = self.mlp(combined)  # n, k
+        else:
+            coeffs = self.mlp(self.source_grid)  # n, k
+        
         logits = torch.einsum("nk,khw->nhw", coeffs, self.basis) / math.sqrt(k)
-
         return logits
     
 
@@ -160,7 +169,6 @@ class FullFactorized2d(Readout):
         spatial_reg_weight=None,
         feature_reg_weight=None,
         gamma_readout=None,
-        temperature=None,
         factorize_spatial=False,
         regularizer_type="l1",
         gamma_sigma=0.1,
@@ -169,6 +177,12 @@ class FullFactorized2d(Readout):
         fourier_spatial=True,
         fourier_max_freq=4,
         whitener=None,
+        init_temp=1.0,
+        hard=False,
+        normalize_logits=False,
+        retinotopy_in_dim=2,
+        entropy_reg=False,
+        entropy_reg_weight=1.0,
         **kwargs,
     ):
         """
@@ -200,7 +214,12 @@ class FullFactorized2d(Readout):
         self.positive_spatial = positive_spatial
         self.factorize_spatial = factorize_spatial
         self.whitener = whitener
+        self.temperature = init_temp
         self._regularizer_type = regularizer_type
+        self.hard = hard
+        self.normalize_logits = normalize_logits
+        self.entropy_reg = entropy_reg
+        self.entropy_reg_weight = entropy_reg_weight
 
         if self._regularizer_type == "adaptive_log_norm":
             self.gamma_sigma = gamma_sigma
@@ -222,7 +241,6 @@ class FullFactorized2d(Readout):
         self.feature_reg_weight = self.resolve_deprecated_gamma_readout(
             feature_reg_weight, gamma_readout, default=1.0
         )
-        self.temperature = temperature
 
         self._original_features = True
         self.initialize_features(**(shared_features or {}))
@@ -259,10 +277,9 @@ class FullFactorized2d(Readout):
 
         self.initialize()
 
-    @property
-    def spatial(self):
+    def spatial(self, pupil_center=None):
         if self._retinotopy:
-            return self.retinotopy_spatial()
+            return self.retinotopy_spatial(pupil_center)
         else:
             if self._fourier:
                 k = self.basis.shape[0]
@@ -290,20 +307,20 @@ class FullFactorized2d(Readout):
         else:
             return self._features
 
-    @property
-    def weight(self):
-        if self.positive_weights:
-            self.features.data.clamp_min_(0)
-        n = self.outdims
-        c, h, w = self.in_shape
-        return self.normalized_spatial.view(n, 1, w, h) * self.features.view(n, c, 1, 1)
+    # @property
+    # def weight(self):
+    #     if self.positive_weights:
+    #         self.features.data.clamp_min_(0)
+    #     n = self.outdims
+    #     c, h, w = self.in_shape
+    #     return self.normalized_spatial.view(n, 1, w, h) * self.features.view(n, c, 1, 1)
 
-    @property
-    def normalized_spatial(self):
+    def normalized_spatial(self, pupil_center=None):
         """
         Normalize the spatial mask
         """
-        weight = self.spatial
+        weight = self.spatial(pupil_center=pupil_center)
+        o, h, w = weight.shape
         if self.constrain_pos:
             weight.data.clamp_min_(0)
         elif self.positive_spatial:
@@ -312,23 +329,35 @@ class FullFactorized2d(Readout):
             # norm = weight.abs().sum(dim=1, keepdim=True)
             # norm = norm.sum(dim=2, keepdim=True).expand_as(self.spatial) + 1e-6
             # weight = weight / norm
-            o, h, w = weight.shape
-            weight = nn.functional.softmax(weight.view(o, h * w) / self.temperature, dim=1).view(o, h, w)
+            
+            if self.normalize_logits:
+                z = weight.view(o, h * w)
+                z = z - z.mean(dim=-1, keepdim=True)
+                z = z / (z.std(dim=-1, keepdim=True) + 1e-5)
+                weight = F.softmax(z / self.temperature, dim=-1).view(o, h, w)
+            else:
+                weight = F.softmax(weight.view(o, h * w) / self.temperature, dim=1).view(o, h, w)
+            
+            # straight through trick to get onehot outputs while preserving gradients
+            if self.hard:
+                flat = weight.view(o, h * w)
+                argmax = flat.argmax(-1)
+                onehot = torch.zeros_like(flat)
+                onehot.scatter_(1, argmax[:, None], 1.0)
+                onehot = onehot.view(o, h, w)
+                weight = onehot.detach() - weight.detach() + weight
     
         return weight
 
-    def adaptive_feature_l1_lognorm(self, reduction="sum", average=None):
-        if self.whitener is not None:
-            features = self.whitener.whiten_readouts(self.features.T).squeeze().T
-        else:
-            features = self.features
-        features = self.adaptive_neuron_reg_coefs.abs() * features
+    def adaptive_feature_l1_lognorm(self, features, reduction="sum", average=None):
+        scaled = self.adaptive_neuron_reg_coefs.abs() * features
         
         features_regularization = (
-            self.apply_reduction(features.abs(), reduction=reduction, average=average) * self.feature_reg_weight
+            self.apply_reduction(scaled.abs(), reduction=reduction, average=average) * self.feature_reg_weight
         )
         # adaptive_neuron_reg_coefs (betas) are supposted to be from lognorm distribution
         coef_prior = 1 / (self.gamma_sigma**2) * ((torch.log(self.adaptive_neuron_reg_coefs.abs()) ** 2).sum())
+
         return features_regularization + coef_prior
 
     def l1(self, reduction="sum", average=None):
@@ -344,12 +373,26 @@ class FullFactorized2d(Readout):
         if reduction == "mean":
             ret = ret / (n * c * w * h)
         return ret
+    
+    def entropy_regularizer(self, features):
+        n, c = features.shape  # n x c
+        normalized = features.abs().sum(0) / (features.abs().sum() * n)
+        penalty = -(normalized * normalized.log()).sum() * self.entropy_reg_weight
+
+        return penalty
 
     def regularizer(self, reduction="sum", average=None):
-        return (
-            self.adaptive_feature_l1_lognorm(reduction=reduction, average=average)
-            + self.l1(reduction=reduction, average=average)
-        )
+        if self.whitener is not None:
+            features = self.whitener.whiten_readouts(self.features.T).squeeze().T
+        else:
+            features = self.features
+
+        penalty = 0
+        if self.feature_reg_weight > 0:
+            penalty += self.adaptive_feature_l1_lognorm(features, reduction=reduction, average=average)
+        if self.entropy_reg:
+            penalty += self.entropy_regularizer(features)
+        return penalty
 
     def initialize(self, mean_activity=None):
         """
@@ -401,7 +444,10 @@ class FullFactorized2d(Readout):
             self._features = nn.Parameter(torch.Tensor(self.outdims, c))  # feature weights for each channel of the core
             self._shared_features = False
 
-    def forward(self, x, shift=None, **kwargs):
+    def forward(self, x, shift=None, temp=None, pupil_center=None, **kwargs):
+        if temp is not None:
+            self.temperature = temp  # for temperature annealing
+
         # if shift is not None:
         #     raise NotImplementedError("shift is not implemented for this readout")
         if self.constrain_pos:
@@ -415,7 +461,15 @@ class FullFactorized2d(Readout):
         if shift is not None:
             x = shift_feature_maps(x, shift)
 
-        y_vec = torch.einsum("ncwh,owh->nco", x, self.normalized_spatial)
+        if pupil_center is None:
+            y_vec = torch.einsum("ncwh,owh->nco", x, self.normalized_spatial())
+        else:
+            # loop because of memory
+            y_vec = torch.stack([
+                torch.einsum("cwh,owh->co", img, self.normalized_spatial(pupil_center=pupil))
+                for img, pupil in zip(x, pupil_center)
+            ])
+                
         if self.whitener is not None:
             _ = self.whitener(y_vec).squeeze()
             # if not self.training:

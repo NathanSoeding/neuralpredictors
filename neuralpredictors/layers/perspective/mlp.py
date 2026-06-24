@@ -267,26 +267,27 @@ class SinglePerspective(nn.Module):
 
         self.retina = retina
         self.monitor = monitor
-        self.pixel_transform = pixel_transform
-        self.static_power = static_power
+        # self.pixel_transform = pixel_transform
+        # self.static_power = static_power
 
     def forward(self, img, pupil_center):
         rays = self.retina.rays(pupil_center)
         grid = self.monitor.project(rays)
 
-        pixels = img
 
-        img = (pixels[:, None, 0, :, :] / 255.0).pow(self.static_power)
-        behaviour = pixels[:, 1:, :, :]
-        pixels = torch.concat([img, behaviour], axis=1)
-
+        # img = (pixels[:, None, 0, :, :] / 255.0).pow(self.static_power)
+        # behaviour = pixels[:, 1:, :, :]
+        # pixels = torch.concat([img, behaviour], axis=1)
+        pixels = img[:, None, 0, :, :]
+        behaviour = img[:, 1:, 0, 0]
         pixels = self.monitor.sample_screen(pixels, grid)
 
-        img = self.pixel_transform(pixels[:, None, 0, :, :])
-        behaviour = pixels[:, 1:, :, :]
-        pixels = torch.concat([img, behaviour], axis=1)
+        # img = self.pixel_transform(pixels[:, None, 0, :, :])
+        # behaviour = pixels[:, 1:, :, :]
+        b, c, h, w, = pixels.shape
+        output = torch.concat([pixels, behaviour[:, :, None, None].expand(-1, -1, h, w)], axis=1)
 
-        return pixels
+        return output
 
 
 class Perspective(nn.ModuleDict):

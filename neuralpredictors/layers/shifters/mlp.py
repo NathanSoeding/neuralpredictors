@@ -3,7 +3,8 @@ import logging
 import torch
 from torch import nn
 from torch.nn import ModuleDict
-from torch.nn.init import xavier_normal
+from torch.nn.init import xavier_normal_
+import math
 
 from .base import Shifter
 
@@ -11,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class MLP(Shifter):
-    def __init__(self, input_features=2, hidden_channels=10, shift_layers=1, bias=True, **kwargs):
+    def __init__(self, input_features=2, hidden_channels=10, shift_layers=1, bias=True, stochastic=False, init_noise=1.0, **kwargs):
         """
         Multi-layer perceptron shifter
         Args:
@@ -31,13 +32,45 @@ class MLP(Shifter):
         feat.extend([nn.Linear(prev_output, 2, bias=bias), nn.Tanh()])
         self.mlp = nn.Sequential(*feat)
 
+        self.stochastic = stochastic
+        self.init_noise = init_noise
+
+        if self.stochastic:
+            # Learned covariance via Cholesky factor L (lower triangular), so Σ = L @ L.T
+            # L is parameterized as [log(L_11), L_21, log(L_22)] for positive-definiteness.
+            # log-diagonal ensures positive diagonal entries after exp().
+            self.chol_log_diag = nn.Parameter(torch.zeros(2))       # log of diagonal: [log L_00, log L_11]
+            self.chol_off_diag = nn.Parameter(torch.zeros(1))       # lower-triangular off-diagonal: [L_10]
+
+        self.initialize()
+
+    def _cholesky_factor(self):
+        """Builds the 2x2 lower-triangular Cholesky factor L with positive diagonal."""
+        L = torch.zeros(2, 2, device=self.chol_log_diag.device, dtype=self.chol_log_diag.dtype)
+        L[0, 0] = torch.exp(self.chol_log_diag[0])
+        L[1, 0] = self.chol_off_diag[0]
+        L[1, 1] = torch.exp(self.chol_log_diag[1])
+        return L  # Σ = L @ L.T
+
+    def covariance(self):
+        """Returns the full 2x2 covariance matrix Σ = L @ L.T (detached, for inspection)."""
+        L = self._cholesky_factor()
+        return L @ L.T
+
     def regularizer(self):
         return 0
 
     def initialize(self):
-        for linear_layer in [p for p in self.parameters() if isinstance(p, nn.Linear)]:
-            xavier_normal(linear_layer.weight)
+        for layer in self.mlp:
+            if isinstance(layer, nn.Linear):
+                xavier_normal_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
 
+        if self.stochastic:
+            nn.init.constant_(self.chol_log_diag, math.log(self.init_noise))
+            nn.init.zeros_(self.chol_off_diag)
+    
     def forward(self, pupil_center, trial_idx=None):
         if trial_idx is not None:
             pupil_center = torch.cat((pupil_center, trial_idx), dim=1)
@@ -46,7 +79,17 @@ class MLP(Shifter):
                 "The expected input shape of the shifter and the shape of the input do not match! "
                 "(Maybe due to the appending of trial_idx to pupil_center?)"
             )
-        return self.mlp(pupil_center)
+
+        mu = self.mlp(pupil_center)
+
+        if self.stochastic and self.training:
+            # Reparameterization trick: z = mu + L @ eps,  eps ~ N(0, I)
+            L = self._cholesky_factor()                              # (2, 2)
+            eps = torch.randn_like(mu)                               # (batch, 2)
+            # L @ eps.T → (2, batch), then transpose → (batch, 2)
+            return mu + (L @ eps.T).T
+        
+        return mu
 
 
 class MLPShifter(ModuleDict):
@@ -58,6 +101,8 @@ class MLPShifter(ModuleDict):
         shift_layers=1,
         gamma_shifter=0,
         bias=True,
+        stochastic=False,
+        init_noise=1.0,
         **kwargs
     ):
         """
@@ -70,12 +115,10 @@ class MLPShifter(ModuleDict):
         super().__init__()
         self.gamma_shifter = gamma_shifter
         for k in data_keys:
-            self.add_module(k, MLP(input_channels, hidden_channels_shifter, shift_layers, bias))
+            self.add_module(k, MLP(input_channels, hidden_channels_shifter, shift_layers, bias, stochastic, init_noise))
 
     def initialize(self, **kwargs):
-        logger.info("Ignoring input {} when initializing {}".format(repr(kwargs), self.__class__.__name__))
-        for linear_layer in [p for p in self.parameters() if isinstance(p, nn.Linear)]:
-            xavier_normal(linear_layer.weight)
+        pass
 
     def regularizer(self, data_key):
         return self[data_key].regularizer() * self.gamma_shifter

@@ -64,10 +64,10 @@ class FiringRateEncoder(Encoder):
         shift=None,
         detach_core=False,
         return_vec=False,
+        temp=None,
         **kwargs
     ):
         x = inputs
-
         if self.perspective:
             if self.shifter:
                 raise ValueError("both perspective and shifter cannot be present together, only one should be chosen")
@@ -88,7 +88,10 @@ class FiringRateEncoder(Encoder):
                 raise ValueError("pupil_center is not given")
             shift = self.shifter[data_key](pupil_center, trial_idx)
 
-        x, vec = self.readout(x, data_key=data_key, shift=shift, **kwargs)
+        if self.shifter or self.perspective:
+            x, vec = self.readout(x, data_key=data_key, shift=shift, temp=temp, pupil_center=None, **kwargs)
+        else:            
+            x, vec = self.readout(x, data_key=data_key, shift=None, temp=temp, pupil_center=pupil_center, **kwargs)
         x = x[None, ...] if len(x.shape) == 1 else x  # keep dimensions if only one image was passed
 
         if self.modulator:
