@@ -31,13 +31,18 @@ class MLP(Shifter):
         feat.extend([nn.Linear(prev_output, 2, bias=bias), nn.Tanh()])
         self.mlp = nn.Sequential(*feat)
 
+        self.initialize()
+
     def regularizer(self):
         return 0
 
     def initialize(self):
-        for linear_layer in [p for p in self.parameters() if isinstance(p, nn.Linear)]:
-            xavier_normal(linear_layer.weight)
-
+        for layer in self.mlp:
+            if isinstance(layer, nn.Linear):
+                xavier_normal_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+        
     def forward(self, pupil_center, trial_idx=None):
         if trial_idx is not None:
             pupil_center = torch.cat((pupil_center, trial_idx), dim=1)
@@ -73,9 +78,7 @@ class MLPShifter(ModuleDict):
             self.add_module(k, MLP(input_channels, hidden_channels_shifter, shift_layers, bias))
 
     def initialize(self, **kwargs):
-        logger.info("Ignoring input {} when initializing {}".format(repr(kwargs), self.__class__.__name__))
-        for linear_layer in [p for p in self.parameters() if isinstance(p, nn.Linear)]:
-            xavier_normal(linear_layer.weight)
+        pass
 
     def regularizer(self, data_key):
         return self[data_key].regularizer() * self.gamma_shifter
