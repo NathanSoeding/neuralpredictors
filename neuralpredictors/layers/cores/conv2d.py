@@ -48,6 +48,7 @@ class Stacked2dCore(ConvCore, nn.Module):
         layers=3,
         gamma_hidden=0,
         gamma_input=0.0,
+        gamma_com=0.0,
         skip=0,
         stride=1,
         input_stride=1,
@@ -139,6 +140,7 @@ class Stacked2dCore(ConvCore, nn.Module):
         self.num_layers = layers
         self.gamma_input = gamma_input
         self.gamma_hidden = gamma_hidden
+        self.gamma_com = gamma_com
         self.input_channels = input_channels
 
         if isinstance(hidden_channels, Iterable) and skip > 1:
@@ -288,8 +290,48 @@ class Stacked2dCore(ConvCore, nn.Module):
             ret = ret + feature.conv.weight.pow(2).sum(3, keepdim=True).sum(2, keepdim=True).sqrt().mean()
         return ret / ((self.num_layers - 1) if self.num_layers > 1 else 1)
 
+    def center_of_mass(self):
+        """
+        Penalize filters whose center of mass deviates from the kernel center.
+        """
+        ret = 0.0
+        n = 0
+
+        for feature in self.features:
+            w = feature.conv.weight
+
+            _, _, kH, kW = w.shape
+
+            y = torch.arange(kH, device=w.device, dtype=w.dtype)
+            x = torch.arange(kW, device=w.device, dtype=w.dtype)
+
+            y_grid = y.view(1, 1, kH, 1)
+            x_grid = x.view(1, 1, 1, kW)
+
+            mass = w.abs()
+            mass_sum = mass.sum(dim=(2, 3), keepdim=True) + 1e-6
+
+            x_cm = (mass * x_grid).sum(dim=(2, 3), keepdim=True) / mass_sum
+            y_cm = (mass * y_grid).sum(dim=(2, 3), keepdim=True) / mass_sum
+
+            x_center = (kW - 1) / 2.0
+            y_center = (kH - 1) / 2.0
+
+            penalty = (x_cm - x_center).pow(2) + (y_cm - y_center).pow(2)
+
+            ret += penalty.mean()
+            n += 1
+
+        return ret / max(n, 1)
+
     def regularizer(self):
-        return self.group_sparsity() * self.gamma_hidden + self.gamma_input * self.laplace()
+        com = self.gamma_com * self.center_of_mass()
+        print(com, flush=True)
+        return (
+            self.gamma_hidden * self.group_sparsity()
+            + self.gamma_input * self.laplace()
+            + com
+        )
 
     @property
     def outchannels(self):
