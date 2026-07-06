@@ -52,7 +52,7 @@ class RetinotopySpatial(nn.Module):
         
         return spatial
 
-def real_fourier_basis(H, W, max_freq):
+def real_fourier_basis(H, W, max_freq, diagonal):
     y = torch.arange(H)
     x = torch.arange(W)
     Y, X = torch.meshgrid(y, x, indexing="ij")
@@ -65,9 +65,13 @@ def real_fourier_basis(H, W, max_freq):
             ) / max(H, W)
 
             # also get rid of cosine for 0, 0 as we use softmax which is logit shift invariant
-            if not (u == 0 and v == 0):
-                basis.append(torch.cos(phase))
-                basis.append(torch.sin(phase))
+            if u == 0 and v == 0:
+                continue
+            if (not diagonal) and u != 0 and v != 0:
+                continue
+
+            basis.append(torch.cos(phase))
+            basis.append(torch.sin(phase))
 
     basis = torch.stack(basis)
     mask = torch.zeros(basis.shape[0], dtype=bool)
@@ -80,7 +84,7 @@ def real_fourier_basis(H, W, max_freq):
     return basis[mask]
 
 class FourierRetinotopy(nn.Module):
-    def __init__(self, source_grid, out_shape, max_freq=3, hidden_features=20, hidden_layers=0, in_dim=None):
+    def __init__(self, source_grid, out_shape, max_freq=3, diagonal=True, hidden_features=20, hidden_layers=0, in_dim=None):
         super().__init__()
 
         source_grid = source_grid - source_grid.mean(axis=0, keepdims=True)
@@ -89,7 +93,7 @@ class FourierRetinotopy(nn.Module):
         self.out_shape = out_shape
 
         n, h, w = self.out_shape
-        self.register_buffer("basis", real_fourier_basis(h, w, max_freq))
+        self.register_buffer("basis", real_fourier_basis(h, w, max_freq, diagonal))
         k = self.basis.shape[0]
 
         in_dim = source_grid.shape[1] if in_dim is None else in_dim
@@ -183,6 +187,8 @@ class FullFactorized2d(Readout):
         retinotopy_in_dim=2,
         entropy_reg=False,
         entropy_reg_weight=1.0,
+        diagonal=True,
+        com_reg_weight=0.0,
         **kwargs,
     ):
         """
@@ -220,6 +226,7 @@ class FullFactorized2d(Readout):
         self.normalize_logits = normalize_logits
         self.entropy_reg = entropy_reg
         self.entropy_reg_weight = entropy_reg_weight
+        self.com_reg_weight = com_reg_weight
 
         if self._regularizer_type == "adaptive_log_norm":
             self.gamma_sigma = gamma_sigma
@@ -256,7 +263,7 @@ class FullFactorized2d(Readout):
         elif retinotopy_spatial is None and fourier_spatial:
             self._retinotopy = False
             self._fourier = True
-            self.register_buffer("basis", real_fourier_basis(h, w, fourier_max_freq))
+            self.register_buffer("basis", real_fourier_basis(h, w, fourier_max_freq, diagonal))
             k = self.basis.shape[0]
             self.coeffs = nn.Parameter(torch.Tensor(self.outdims, k))
             print('fourier coeffs shape:', self.coeffs.shape)
@@ -267,7 +274,7 @@ class FullFactorized2d(Readout):
         elif retinotopy_spatial is not None and fourier_spatial:
             self._retinotopy = True
             self._fourier = True
-            self.retinotopy_spatial = FourierRetinotopy(source_grid, (self.outdims, h, w), fourier_max_freq, **retinotopy_spatial)
+            self.retinotopy_spatial = FourierRetinotopy(source_grid, (self.outdims, h, w), fourier_max_freq, diagonal, **retinotopy_spatial)
 
         if bias:
             bias = nn.Parameter(torch.Tensor(outdims))
@@ -381,6 +388,31 @@ class FullFactorized2d(Readout):
 
         return penalty
 
+    def center_of_mass(self):
+        """ Penalize neurons whose RF center deviates from the image center. """
+        spatial = self.normalized_spatial()
+
+        o, h, w = spatial.shape
+
+        y = torch.arange(h, device=spatial.device, dtype=spatial.dtype)
+        x = torch.arange(w, device=spatial.device, dtype=spatial.dtype)
+
+        y_grid = y.view(1, h, 1)
+        x_grid = x.view(1, 1, w)
+
+        mass = spatial.abs()
+        normalized_mass = mass / mass.sum(dim=(1, 2), keepdim=True) + 1e-6
+
+        x_cm = (normalized_mass * x_grid).sum(dim=(1, 2))
+        y_cm = (normalized_mass * y_grid).sum(dim=(1, 2))
+
+        x_center = (w - 1) / 2.0
+        y_center = (h - 1) / 2.0
+
+        penalty = ((x_cm - x_center).pow(2) + (y_cm - y_center).pow(2)).sqrt()
+        
+        return penalty.sum()
+
     def regularizer(self, reduction="sum", average=None):
         if self.whitener is not None:
             features = self.whitener.whiten_readouts(self.features.T).squeeze().T
@@ -392,6 +424,8 @@ class FullFactorized2d(Readout):
             penalty += self.adaptive_feature_l1_lognorm(features, reduction=reduction, average=average)
         if self.entropy_reg:
             penalty += self.entropy_regularizer(features)
+        if self.com_reg_weight > 0:
+            penalty += self.center_of_mass() * self.com_reg_weight
         return penalty
 
     def initialize(self, mean_activity=None):

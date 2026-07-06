@@ -86,6 +86,9 @@ class FiringRateEncoder(Encoder):
             # if shift is defined - no need to change it
             if pupil_center is None:
                 raise ValueError("pupil_center is not given")
+                
+            if data_key == '26872-17-20':
+                pupil_center[:] = 0
             shift = self.shifter[data_key](pupil_center, trial_idx)
 
         if self.shifter or self.perspective:

@@ -326,7 +326,6 @@ class Stacked2dCore(ConvCore, nn.Module):
 
     def regularizer(self):
         com = self.gamma_com * self.center_of_mass()
-        print(com, flush=True)
         return (
             self.gamma_hidden * self.group_sparsity()
             + self.gamma_input * self.laplace()
