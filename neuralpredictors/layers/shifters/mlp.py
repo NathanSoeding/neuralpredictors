@@ -3,7 +3,7 @@ import logging
 import torch
 from torch import nn
 from torch.nn import ModuleDict
-from torch.nn.init import xavier_normal
+from torch.nn.init import xavier_normal_
 
 from .base import Shifter
 
@@ -37,11 +37,12 @@ class MLP(Shifter):
         return 0
 
     def initialize(self):
-        for layer in self.mlp:
-            if isinstance(layer, nn.Linear):
-                xavier_normal_(layer.weight)
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
+        with torch.no_grad():
+            for layer in self.mlp:
+                if isinstance(layer, nn.Linear):
+                    xavier_normal_(layer.weight)
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
         
     def forward(self, pupil_center, trial_idx=None):
         if trial_idx is not None:
@@ -76,9 +77,6 @@ class MLPShifter(ModuleDict):
         self.gamma_shifter = gamma_shifter
         for k in data_keys:
             self.add_module(k, MLP(input_channels, hidden_channels_shifter, shift_layers, bias))
-
-    def initialize(self, **kwargs):
-        pass
 
     def regularizer(self, data_key):
         return self[data_key].regularizer() * self.gamma_shifter
