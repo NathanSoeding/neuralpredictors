@@ -78,5 +78,9 @@ class MLPShifter(ModuleDict):
         for k in data_keys:
             self.add_module(k, MLP(input_channels, hidden_channels_shifter, shift_layers, bias))
 
+    def initialize(self, **kwargs):
+         for k in self:
+             self[k].initialize()
+
     def regularizer(self, data_key):
         return self[data_key].regularizer() * self.gamma_shifter

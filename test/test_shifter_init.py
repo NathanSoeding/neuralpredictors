@@ -1,5 +1,3 @@
-import torch
-from torch import nn
 from unittest.mock import patch
 
 from neuralpredictors.layers.shifters import MLP
