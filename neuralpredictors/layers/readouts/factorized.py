@@ -121,6 +121,80 @@ class FourierRetinotopy(nn.Module):
         logits = torch.einsum("nk,khw->nhw", coeffs, self.basis) / math.sqrt(k)
         return logits
 
+class GaussianRetinotopy(nn.Module):
+    def __init__(self, source_grid, out_shape, predict_sigma=False, init_sigma=0.05, sigma_range=(0.01, 0.3), hidden_features=20, hidden_layers=0, in_dim=None):
+        super().__init__()
+        source_grid = source_grid - source_grid.mean(axis=0, keepdims=True)
+        source_grid = source_grid / np.abs(source_grid).max()
+        self.register_buffer("source_grid", torch.from_numpy(source_grid.astype(np.float32)))
+
+        self.out_shape = out_shape
+        n, h, w = self.out_shape
+        self.predict_sigma = predict_sigma
+        self.sigma_range = sigma_range
+
+        in_dim = source_grid.shape[1] if in_dim is None else in_dim
+        self.inp_dim = in_dim
+
+        # output dim: 2 for (x, y) center, +1 more if predicting sigma
+        out_dim = 3 if predict_sigma else 2
+
+        layers = []
+        for hidden_dim in [hidden_features] * hidden_layers:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.ELU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, out_dim))
+        self.mlp = nn.Sequential(*layers)
+
+        if not predict_sigma:
+            # fixed, learnable scalar sigma (in normalized [-1,1] coord units)
+            self.log_sigma = nn.Parameter(torch.log(torch.tensor(float(init_sigma))))
+
+        # precompute pixel grid once (buffers, not parameters)
+        ys = torch.linspace(-1, 1, h) * (h / max(h, w))
+        xs = torch.linspace(-1, 1, w) * (w / max(h, w))
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')  # (h, w)
+        self.register_buffer("grid_x", grid_x.clone())
+        self.register_buffer("grid_y", grid_y.clone())
+
+    def forward(self, pupil_center=None):
+        n, _ = self.source_grid.shape
+
+        if pupil_center is not None:
+            combined = torch.cat([
+                self.source_grid,
+                pupil_center.unsqueeze(0).expand(n, -1),
+            ], dim=-1)
+            out = self.mlp(combined)  # n, out_dim
+        else:
+            out = self.mlp(self.source_grid)  # n, out_dim
+
+        # center coords, squashed to [-1, 1]
+        center = torch.tanh(out[:, :2])  # n, 2  (x, y)
+
+        h, w = self.out_shape[1], self.out_shape[2]
+        scale = torch.tensor([w, h], dtype=center.dtype, device=center.device) / max(h, w)
+        center = center * scale  # now in same coordinate space as grid_x/grid_y
+
+        if self.predict_sigma:
+            lo, hi = self.sigma_range
+            sigma = lo + (hi - lo) * torch.sigmoid(out[:, 2])  # n,
+        else:
+            sigma = self.log_sigma.exp().expand(n)  # n,
+
+        px = center[:, 0].view(n, 1, 1)  # (n,1,1)
+        py = center[:, 1].view(n, 1, 1)
+        sigma = sigma.view(n, 1, 1)
+
+        grid_x = self.grid_x.unsqueeze(0)  # (1,h,w)
+        grid_y = self.grid_y.unsqueeze(0)
+
+        dist_sq = (grid_x - px) ** 2 + (grid_y - py) ** 2
+        logits = -dist_sq / (2 * sigma ** 2)  # log-gaussian, unnormalized (peak at 0)
+
+        return logits
+
 class DiscretizedRetinotopy(nn.Module):
     def __init__(self, source_grid, out_shape, kernel_size=7, sigma=2.0):
         super().__init__()
