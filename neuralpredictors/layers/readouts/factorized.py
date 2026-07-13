@@ -120,7 +120,51 @@ class FourierRetinotopy(nn.Module):
         
         logits = torch.einsum("nk,khw->nhw", coeffs, self.basis) / math.sqrt(k)
         return logits
-    
+
+class DiscretizedRetinotopy(nn.Module):
+    def __init__(self, source_grid, out_shape, kernel_size=7, sigma=2.0):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.sigma = sigma
+
+        source_grid = source_grid - source_grid.mean(axis=0, keepdims=True)
+        source_grid = source_grid / np.abs(source_grid).max()
+        self.register_buffer("source_grid", torch.from_numpy(source_grid.astype(np.float32)))
+        
+        n, h, w = out_shape
+        self.weights = torch.nn.Parameter(
+            torch.normal(mean=torch.ones(2, 1, h, w), std=torch.ones(2, 1, h, w))
+        )
+        self.bias = torch.nn.Parameter(
+            torch.normal(mean=torch.ones(1, 1, h, w), std=torch.ones(1, 1, h, w))
+        )
+        
+    @property
+    def gaussian_kernel(self):
+        x = torch.arange(self.kernel_size) - self.kernel_size // 2
+        xx, yy = torch.meshgrid(x, x, indexing="ij")
+        kernel = torch.exp(-(xx**2 + yy**2) / (2 * self.sigma**2))
+        kernel /= kernel.sum()
+        return kernel.view(1, 1, self.kernel_size, self.kernel_size)
+
+    @property
+    def smooth_w(self):
+        d, _, h, w = self.weights.shape
+        kernel = self.gaussian_kernel.to(self.source_grid.device)
+        w = F.conv2d(self.weights, kernel, padding='same').view(d, h, w)
+        return w
+
+    @property
+    def smooth_b(self):
+        _, _, h, w = self.bias.shape
+        kernel = self.gaussian_kernel.to(self.source_grid.device)
+        b = F.conv2d(self.bias, kernel, padding='same').view(1, h, w)
+        return b
+
+    def forward(self, pupil_center=None):
+        x = torch.einsum('nd,dhw->nhw', self.source_grid, self.smooth_w)
+        x = x + self.smooth_b
+        return x
 
 def shift_feature_maps(x, shifts):
     """
@@ -178,7 +222,7 @@ class FullFactorized2d(Readout):
         gamma_sigma=0.1,
         source_grid=None,
         retinotopy_spatial=None,
-        fourier_spatial=True,
+        fourier_spatial=False,
         fourier_max_freq=4,
         whitener=None,
         init_temp=1.0,
@@ -189,6 +233,12 @@ class FullFactorized2d(Readout):
         entropy_reg_weight=1.0,
         diagonal=True,
         com_reg_weight=0.0,
+        gaussian_spatial=False,
+        predict_sigma=False,
+        init_sigma=1.0,
+        discretized_spatial=False,
+        kernel_size=7,
+        sigma=2.0,
         **kwargs,
     ):
         """
@@ -267,14 +317,22 @@ class FullFactorized2d(Readout):
             k = self.basis.shape[0]
             self.coeffs = nn.Parameter(torch.Tensor(self.outdims, k))
             print('fourier coeffs shape:', self.coeffs.shape)
-        elif retinotopy_spatial is not None and not fourier_spatial:
-            self._retinotopy = True
-            self._fourier = False
-            self.retinotopy_spatial = RetinotopySpatial(source_grid, (self.outdims, h, w), self.factorize_spatial, **retinotopy_spatial)
         elif retinotopy_spatial is not None and fourier_spatial:
             self._retinotopy = True
             self._fourier = True
             self.retinotopy_spatial = FourierRetinotopy(source_grid, (self.outdims, h, w), fourier_max_freq, diagonal, **retinotopy_spatial)
+        elif retinotopy_spatial is not None and gaussian_spatial:
+            self._retinotopy = True
+            self._gaussian = True
+            self.retinotopy_spatial = GaussianRetinotopy(source_grid, (self.outdims, h, w), predict_sigma, init_sigma, **retinotopy_spatial)
+        elif retinotopy_spatial is not None and discretized_spatial:
+            self._retinotopy = True
+            self._discretized = True
+            self.retinotopy_spatial = DiscretizedRetinotopy(source_grid, (self.outdims, h, w), kernel_size, sigma)
+        elif retinotopy_spatial is not None:
+            self._retinotopy = True
+            self._fourier = False
+            self.retinotopy_spatial = RetinotopySpatial(source_grid, (self.outdims, h, w), self.factorize_spatial, **retinotopy_spatial)
 
         if bias:
             bias = nn.Parameter(torch.Tensor(outdims))
