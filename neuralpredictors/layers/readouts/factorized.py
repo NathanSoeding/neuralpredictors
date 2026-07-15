@@ -196,7 +196,7 @@ class GaussianRetinotopy(nn.Module):
         return logits
 
 class DiscretizedRetinotopy(nn.Module):
-    def __init__(self, source_grid, out_shape, kernel_size=7, sigma=2.0):
+    def __init__(self, source_grid, out_shape, kernel_size=7, sigma=2.0, in_dim=None):
         super().__init__()
         self.kernel_size = kernel_size
         self.sigma = sigma
@@ -204,15 +204,18 @@ class DiscretizedRetinotopy(nn.Module):
         source_grid = source_grid - source_grid.mean(axis=0, keepdims=True)
         source_grid = source_grid / np.abs(source_grid).max()
         self.register_buffer("source_grid", torch.from_numpy(source_grid.astype(np.float32)))
-        
+
         n, h, w = out_shape
+        in_dim = source_grid.shape[1] if in_dim is None else in_dim
+        self.inp_dim = in_dim
+
         self.weights = torch.nn.Parameter(
-            torch.normal(mean=torch.ones(2, 1, h, w), std=torch.ones(2, 1, h, w))
+            torch.normal(mean=torch.ones(in_dim, 1, h, w), std=torch.ones(in_dim, 1, h, w))
         )
         self.bias = torch.nn.Parameter(
             torch.normal(mean=torch.ones(1, 1, h, w), std=torch.ones(1, 1, h, w))
         )
-        
+
     @property
     def gaussian_kernel(self):
         x = torch.arange(self.kernel_size) - self.kernel_size // 2
@@ -225,18 +228,28 @@ class DiscretizedRetinotopy(nn.Module):
     def smooth_w(self):
         d, _, h, w = self.weights.shape
         kernel = self.gaussian_kernel.to(self.source_grid.device)
-        w = F.conv2d(self.weights, kernel, padding='same').view(d, h, w)
-        return w
+        weight = F.conv2d(self.weights, kernel, padding='same').view(d, h, w)
+        return weight
 
     @property
     def smooth_b(self):
         _, _, h, w = self.bias.shape
         kernel = self.gaussian_kernel.to(self.source_grid.device)
-        b = F.conv2d(self.bias, kernel, padding='same').view(1, h, w)
-        return b
+        bias = F.conv2d(self.bias, kernel, padding='same').view(1, h, w)
+        return bias
 
     def forward(self, pupil_center=None):
-        x = torch.einsum('nd,dhw->nhw', self.source_grid, self.smooth_w)
+        n, _ = self.source_grid.shape
+
+        if pupil_center is not None:
+            combined = torch.cat([
+                self.source_grid,
+                pupil_center.unsqueeze(0).expand(n, -1),
+            ], dim=-1)  # n, in_dim
+        else:
+            combined = self.source_grid  # n, in_dim
+
+        x = torch.einsum('nd,dhw->nhw', combined, self.smooth_w)
         x = x + self.smooth_b
         return x
 
@@ -402,7 +415,7 @@ class FullFactorized2d(Readout):
         elif retinotopy_spatial is not None and discretized_spatial:
             self._retinotopy = True
             self._discretized = True
-            self.retinotopy_spatial = DiscretizedRetinotopy(source_grid, (self.outdims, h, w), kernel_size, sigma)
+            self.retinotopy_spatial = DiscretizedRetinotopy(source_grid, (self.outdims, h, w), kernel_size, sigma, retinotopy_spatial['in_dim'])
         elif retinotopy_spatial is not None:
             self._retinotopy = True
             self._fourier = False
