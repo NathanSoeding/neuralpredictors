@@ -649,7 +649,7 @@ class FullFactorized2d(Readout):
                 for img, pupil in zip(x, pupil_center)
             ])
                 
-        if self.whitener is not None:
+        if (self.whitener is not None) and (self.training):
             _ = self.whitener(y_vec).squeeze()
             # if not self.training:
             #     y_vec = whitened
