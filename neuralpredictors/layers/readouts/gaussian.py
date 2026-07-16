@@ -387,7 +387,7 @@ class FullGaussian2d(Readout):
             reduction(str): Specifies the reduction to apply to the output: 'none' | 'mean' | 'sum'
         """
         if self._original_features:
-            if whitener is not None:
+            if whitener:
                 features = whitener.transform_weights(self.features)
             else:
                 features = self.features
@@ -400,7 +400,7 @@ class FullGaussian2d(Readout):
         if self._original_features:
             print(self.features.shape)
             ### do the same shape transformation for feature_l1
-            if whitener is not None:
+            if whitener:
                 features = whitener.transform_weights(self.features)
             else:
                 features = self.features
