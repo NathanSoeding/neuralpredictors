@@ -379,7 +379,7 @@ class FullGaussian2d(Readout):
 
         return self._mu.squeeze().std(0).sum()
 
-    def feature_l1(self, reduction="sum", average=None):
+    def feature_l1(self, whitener=None, reduction="sum", average=None):
         """
         Returns l1 regularization term for features.
         Args:
@@ -387,13 +387,25 @@ class FullGaussian2d(Readout):
             reduction(str): Specifies the reduction to apply to the output: 'none' | 'mean' | 'sum'
         """
         if self._original_features:
-            return self.apply_reduction(self.features.abs(), reduction=reduction, average=average)
+            if whitener is not None:
+                features = whitener.transform_weights(self.features)
+            else:
+                features = self.features
+                
+            return self.apply_reduction(features.abs(), reduction=reduction, average=average)
         else:
             return 0
 
-    def adaptive_feature_l1_lognorm(self, reduction="sum", average=None):
+    def adaptive_feature_l1_lognorm(self, whitener=None, reduction="sum", average=None):
         if self._original_features:
-            features = self.adaptive_neuron_reg_coefs.abs() * self.features
+            print(self.features.shape)
+            ### do the same shape transformation for feature_l1
+            if whitener is not None:
+                features = whitener.transform_weights(self.features)
+            else:
+                features = self.features
+            
+            features = self.adaptive_neuron_reg_coefs.abs() * features
             features_regularization = (
                 self.apply_reduction(features.abs(), reduction=reduction, average=average) * self.feature_reg_weight
             )
@@ -403,11 +415,11 @@ class FullGaussian2d(Readout):
         else:
             return 0
 
-    def regularizer(self, reduction="sum", average=None):
+    def regularizer(self, whitener=None, reduction="sum", average=None):
         if self._regularizer_type == "l1":
-            return self.feature_l1(reduction=reduction, average=average) * self.feature_reg_weight
+            return self.feature_l1(whitener=whitener, reduction=reduction, average=average) * self.feature_reg_weight
         elif self._regularizer_type == "adaptive_log_norm":
-            return self.adaptive_feature_l1_lognorm(reduction=reduction, average=average)
+            return self.adaptive_feature_l1_lognorm(whitener=whitener, reduction=reduction, average=average)
         else:
             raise NotImplementedError(f"Regularizer_type {self._regularizer_type} is not implemented")
 

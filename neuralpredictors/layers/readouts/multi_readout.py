@@ -82,10 +82,10 @@ class MultiReadoutBase(torch.nn.ModuleDict):
             mean_activity = mean_activity_dict[data_key] if mean_activity_dict is not None else None
             readout.initialize(mean_activity)
 
-    def regularizer(self, data_key=None, reduction="sum", average=None):
+    def regularizer(self, data_key=None, whitener=None, reduction="sum", average=None):
         if data_key is None and len(self) == 1:
             data_key = list(self.keys())[0]
-        return self[data_key].regularizer(reduction=reduction, average=average)
+        return self[data_key].regularizer(whitener=whitener, reduction=reduction, average=average)
 
 
 class MultiReadoutSharedParametersBase(MultiReadoutBase):

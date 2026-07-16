@@ -11,6 +11,7 @@ class FiringRateEncoder(Encoder):
     def __init__(
         self,
         core,
+        whitener,
         readout,
         *,
         perspective=None,
@@ -34,6 +35,7 @@ class FiringRateEncoder(Encoder):
         """
         super().__init__()
         self.core = core
+        self.whitener = whitener
         self.readout = readout
         self.perspective = perspective
         self.shifter = shifter
@@ -86,7 +88,11 @@ class FiringRateEncoder(Encoder):
                 raise ValueError("pupil_center is not given")
             shift = self.shifter[data_key](pupil_center, trial_idx)
 
-        x = self.readout(x, data_key=data_key, shift=shift, **kwargs)
+        x, feature_vecs = self.readout(x, data_key=data_key, shift=shift, **kwargs)
+        
+        if self.whitener and self.training:
+            self.whitener.update(feature_vecs)
+
         x = x[None, ...] if len(x.shape) == 1 else x  # keep dimensions if only one image was passed
 
         if self.modulator:
