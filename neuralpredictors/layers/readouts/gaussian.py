@@ -391,7 +391,7 @@ class FullGaussian2d(Readout):
                 features = whitener.transform_weights(self.features)
             else:
                 features = self.features
-                
+
             return self.apply_reduction(features.abs(), reduction=reduction, average=average)
         else:
             return 0
@@ -613,12 +613,12 @@ class FullGaussian2d(Readout):
         if shift is not None:
             grid = grid + shift[:, None, None, :]
 
-        y = F.grid_sample(x, grid, align_corners=self.align_corners)
-        y = (y.squeeze(-1) * feat).sum(1).view(bs, outdims)
+        feature_vecs = F.grid_sample(x, grid, align_corners=self.align_corners)
+        y = (feature_vecs.squeeze(-1) * feat).sum(1).view(bs, outdims)
 
         if self.bias is not None:
             y = y + bias
-        return y
+        return y, feature_vecs
 
     def __repr__(self):
         c, h, w = self.in_shape
