@@ -388,7 +388,7 @@ class FullGaussian2d(Readout):
         """
         if self._original_features:
             if whitener:
-                features = whitener.transform_weights(self.features)
+                features = whitener.transform_weights(self.features.squeeze())[None, :, None, :]
             else:
                 features = self.features
 
@@ -398,10 +398,8 @@ class FullGaussian2d(Readout):
 
     def adaptive_feature_l1_lognorm(self, whitener=None, reduction="sum", average=None):
         if self._original_features:
-            print(self.features.shape)
-            ### do the same shape transformation for feature_l1
             if whitener:
-                features = whitener.transform_weights(self.features)
+                features = whitener.transform_weights(self.features.squeeze())[None, :, None, :]
             else:
                 features = self.features
             
@@ -618,7 +616,7 @@ class FullGaussian2d(Readout):
 
         if self.bias is not None:
             y = y + bias
-        return y, feature_vecs
+        return y, feature_vecs.transpose(1, 2).squeeze(3)
 
     def __repr__(self):
         c, h, w = self.in_shape
