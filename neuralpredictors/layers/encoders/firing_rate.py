@@ -82,17 +82,11 @@ class FiringRateEncoder(Encoder):
         if detach_core:
             x = x.detach()
 
-        if (pupil_center is not None) and (data_key == '26872-17-20'):
-            pupil_center[:] = 0
-
-        if self.shifter and shift is None:
-            # if shift is defined - no need to change it
-            if pupil_center is None:
-                raise ValueError("pupil_center is not given")
+        if self.shifter and pupil_center is not None and shift is None:
             shift = self.shifter[data_key](pupil_center, trial_idx)
 
         x, feature_vecs = self.readout(x, data_key=data_key, shift=shift, **kwargs)
-        
+
         if self.whitener and self.training:
             self.whitener.update(feature_vecs)
 
