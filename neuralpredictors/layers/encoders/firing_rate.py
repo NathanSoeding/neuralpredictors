@@ -82,6 +82,9 @@ class FiringRateEncoder(Encoder):
         if detach_core:
             x = x.detach()
 
+        if (pupil_center is not None) and (data_key == '26872-17-20'):
+            pupil_center[:] = 0
+
         if self.shifter and shift is None:
             # if shift is defined - no need to change it
             if pupil_center is None:

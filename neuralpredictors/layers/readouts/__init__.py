@@ -1,6 +1,6 @@
 from .attention import AttentionReadout
 from .base import ClonedReadout, Readout
-from .factorized import FullFactorized2d, FullSXF, SpatialXFeatureLinear
+from .factorized import Factorized2d, FullSXF, SpatialXFeatureLinear
 from .gaussian import (
     DeterministicGaussian2d,
     FullGaussian2d,

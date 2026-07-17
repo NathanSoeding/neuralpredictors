@@ -41,7 +41,6 @@ class MLP(Shifter):
             for layer in self.mlp:
                 if isinstance(layer, nn.Linear):
                     xavier_normal_(layer.weight, gain=init_gain)
-                    print(layer.weight)
                     if layer.bias is not None:
                         nn.init.zeros_(layer.bias)
         

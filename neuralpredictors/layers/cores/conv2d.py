@@ -55,6 +55,7 @@ class Stacked2dCore(ConvCore, nn.Module):
         elu_shift=(0, 0),
         bias: Union[bool, List[bool]] = True,
         momentum=0.1,
+        track_running_stats=True,
         pad_input=True,
         hidden_padding=None,
         batch_norm: Union[bool, List[bool]] = True,
@@ -164,6 +165,7 @@ class Stacked2dCore(ConvCore, nn.Module):
         self.final_nonlinearity = final_nonlinearity
         self.elu_xshift, self.elu_yshift = elu_shift
         self.momentum = momentum
+        self.track_running_stats = track_running_stats
         self.pad_input = pad_input
         if stack is None:
             self.stack = range(self.num_layers)
@@ -222,7 +224,7 @@ class Stacked2dCore(ConvCore, nn.Module):
             padding=self.input_kern // 2 if self.pad_input else 0,
             bias=self.bias and not self.batch_norm,
         )
-        self.add_bn_layer(layer, 0)
+        self.add_bn_layer(layer, 0, self.track_running_stats)
         self.add_activation(layer)
         self.features.add_module("layer0", nn.Sequential(layer))
 
@@ -247,7 +249,7 @@ class Stacked2dCore(ConvCore, nn.Module):
             layer = OrderedDict()
 
             self.add_subsequent_conv_layer(layer, l)
-            self.add_bn_layer(layer, l)
+            self.add_bn_layer(layer, l, self.track_running_stats)
             self.add_activation(layer)
             self.features.add_module("layer{}".format(l), nn.Sequential(layer))
 

@@ -6,7 +6,7 @@ class Whitener(nn.Module):
     def __init__(self, model_dim, momentum=0.003):
         super().__init__()
 
-        self.register_buffer('mu_ema', torch.zeros(1, 1, model_dim))
+        self.register_buffer('mu_ema', torch.zeros(1, model_dim))
         self.register_buffer('cov_ema', torch.eye(model_dim))
         self.momentum = momentum
 
@@ -21,7 +21,7 @@ class Whitener(nn.Module):
             + self.momentum * mu_hat
         )
         
-        Xc = X - self.mu_ema.squeeze(0)
+        Xc = X - self.mu_ema
 
         sig_hat = Xc.T @ Xc / (batch * neurons - 1)
 
@@ -33,7 +33,7 @@ class Whitener(nn.Module):
     def whiten(self, x, eps=1e-5):
         eye = torch.eye(self.cov_ema.shape[0], dtype=self.cov_ema.dtype, device=self.cov_ema.device)
         L = torch.linalg.cholesky(self.cov_ema + eps * eye)
-        centered = x - self.mu_ema  # (B, N, D)
+        centered = x - self.mu_ema.view(1, 1, x.shape[-1])  # (B, N, D)
         whitened = torch.linalg.solve_triangular(L, centered.transpose(-1, -2), upper=False).transpose(-1, -2)
         return whitened
     
