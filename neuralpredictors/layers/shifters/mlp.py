@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class MLP(Shifter):
-    def __init__(self, input_features=2, hidden_channels=10, shift_layers=1, bias=True, **kwargs):
+    def __init__(self, input_features=2, hidden_channels=10, shift_layers=1, bias=True, init_gain=1.0, **kwargs):
         """
         Multi-layer perceptron shifter
         Args:
@@ -31,16 +31,17 @@ class MLP(Shifter):
         feat.extend([nn.Linear(prev_output, 2, bias=bias), nn.Tanh()])
         self.mlp = nn.Sequential(*feat)
 
-        self.initialize()
+        self.initialize(init_gain)
 
     def regularizer(self):
         return 0
 
-    def initialize(self):
+    def initialize(self, init_gain):
         with torch.no_grad():
             for layer in self.mlp:
                 if isinstance(layer, nn.Linear):
-                    xavier_normal_(layer.weight)
+                    xavier_normal_(layer.weight, gain=init_gain)
+                    print(layer.weight)
                     if layer.bias is not None:
                         nn.init.zeros_(layer.bias)
         
@@ -64,6 +65,7 @@ class MLPShifter(ModuleDict):
         shift_layers=1,
         gamma_shifter=0,
         bias=True,
+        init_gain=1.0,
         **kwargs
     ):
         """
@@ -76,7 +78,7 @@ class MLPShifter(ModuleDict):
         super().__init__()
         self.gamma_shifter = gamma_shifter
         for k in data_keys:
-            self.add_module(k, MLP(input_channels, hidden_channels_shifter, shift_layers, bias))
+            self.add_module(k, MLP(input_channels, hidden_channels_shifter, shift_layers, bias, init_gain))
 
     def initialize(self, **kwargs):
          for k in self:
