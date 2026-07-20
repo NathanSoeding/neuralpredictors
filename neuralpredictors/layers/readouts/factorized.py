@@ -1,4 +1,5 @@
 import warnings
+import math
 
 import numpy as np
 import torch
@@ -55,8 +56,10 @@ class Factorized2d(Readout):
         gamma_sigma=0.1,
         source_grid=None,
         temperature=1.0,
+        temp_per_neuron=False,
         kernel_size=7,
         kernel_sigma=2.0,
+        smoothness_reg_weight=0.0,
         **kwargs,
     ):
         
@@ -65,9 +68,14 @@ class Factorized2d(Readout):
         h, w = in_shape[1:]  # channels, height, width
         self.in_shape = in_shape
         self.outdims = outdims
-        self.temperature = temperature
-        self._regularizer_type = regularizer_type
+
+        self.temp_per_neuron = temp_per_neuron
+        if temp_per_neuron:
+            self.log_temp = nn.Parameter(torch.full((outdims, 1), math.log(temperature)))
+        else:
+            self.temperature = temperature
         
+        self._regularizer_type = regularizer_type
         if self._regularizer_type == "adaptive_log_norm":
             self.gamma_sigma = gamma_sigma
             self.adaptive_neuron_reg_coefs = nn.Parameter(torch.randn(outdims, 1) + 1)
@@ -83,7 +91,12 @@ class Factorized2d(Readout):
         self.initialize_features(**(shared_features or {}))
 
         self.kernel_size = kernel_size
-        self.kernel_sigma = kernel_sigma
+        self._smoothness_reg = smoothness_reg_weight > 0.0
+        if self._smoothness_reg:
+            self.smoothness_reg_weight = smoothness_reg_weight
+            self.kernel_sigma = nn.Parameter(torch.tensor(float(kernel_sigma)))
+        else:
+            self.kernel_sigma = kernel_sigma
 
         if source_grid is None:
             raise ValueError("factorized readout needs source grid for retinotopy mapping")
@@ -93,8 +106,8 @@ class Factorized2d(Readout):
         self.register_buffer("source_grid", torch.from_numpy(source_grid.astype(np.float32)))
 
         in_dim = source_grid.shape[1]
-        self.mask_weights = nn.Parameter(torch.randn(in_dim, 1, h, w))
-        self.mask_bias = nn.Parameter(torch.ones((1, 1, h, w)))
+        self.spatial_w = nn.Parameter(torch.randn(in_dim, h, w))
+        self.spatial_b = nn.Parameter(torch.zeros((1, h, w)))
     
         if bias:
             bias = nn.Parameter(torch.Tensor(outdims))
@@ -179,36 +192,55 @@ class Factorized2d(Readout):
         else:
             return 0
 
+    def exponential_smoothness(self):
+        return torch.exp(-self.kernel_sigma) * self.smoothness_reg_weight
+
     def regularizer(self, whitener=None, reduction="sum", average=None):
+        feature_reg = 0
         if self._regularizer_type == "l1":
-            return self.feature_l1(whitener=whitener, reduction=reduction, average=average) * self.feature_reg_weight
+            feature_reg = self.feature_l1(whitener=whitener, reduction=reduction, average=average) * self.feature_reg_weight
         elif self._regularizer_type == "adaptive_log_norm":
-            return self.adaptive_feature_l1_lognorm(whitener=whitener, reduction=reduction, average=average)
+            feature_reg = self.adaptive_feature_l1_lognorm(whitener=whitener, reduction=reduction, average=average)
         else:
             raise NotImplementedError(f"Regularizer_type {self._regularizer_type} is not implemented")
+        
+        smoothness_reg = 0
+        if self._smoothness_reg:
+            smoothness_reg = self.exponential_smoothness()
+
+        reg = feature_reg + smoothness_reg
+        components = {
+            'feature': feature_reg, 
+            'smoothness': smoothness_reg, 
+        }
+        return reg, components
 
     def gaussian_kernel(self, device):
         x = torch.arange(self.kernel_size, device=device) - self.kernel_size // 2
         xx, yy = torch.meshgrid(x, x, indexing="ij")
         kernel = torch.exp(-(xx**2 + yy**2) / (2 * self.kernel_sigma**2))
-        kernel /= kernel.sum()
+        kernel = kernel / kernel.sum()
         return kernel.view(1, 1, self.kernel_size, self.kernel_size)
 
-    def smooth_weight(self, weight, bias):
-        d, _, h, w = weight.shape
-        kernel = self.gaussian_kernel(weight.device)
-        smooth_weight = F.conv2d(weight, kernel, padding='same').view(d, h, w)
-        smooth_bias = F.conv2d(bias, kernel, padding='same').view(1, h, w)
-        return smooth_weight, smooth_bias
+    def smooth(self, x, kernel):
+        x = F.pad(x, (self.kernel_size // 2, ) * 4, mode='reflect')  # pad to preserve dimentions
+        x = F.conv2d(x.unsqueeze(1), kernel).squeeze(1)
+        return x
     
     @property
     def spatial(self):
-        weights, bias = self.smooth_weight(self.mask_weights, self.mask_bias)
-        mask = torch.einsum('nd,dhw->nhw', self.source_grid, weights)
-        mask = mask + bias
+        rf = torch.einsum('nd,dhw->nhw', self.source_grid, self.spatial_w)
+        rf = rf + self.spatial_b
         
-        n, h, w = mask.shape
-        normalized = F.softmax(mask.view(n, h * w) / self.temperature, dim=1).view(n, h, w)
+        kernel = self.gaussian_kernel(rf.device)
+        rf = self.smooth(rf, kernel)
+        
+        n, h, w = rf.shape
+        if self.temp_per_neuron:
+            temp = self.log_temp.exp() + 1e-3
+        else:
+            temp = self.temperature
+        normalized = F.softmax(rf.view(n, h * w) / temp, dim=1).view(n, h, w)
         return normalized
 
     @property
