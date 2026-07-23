@@ -735,6 +735,7 @@ class GeneralizedFullGaussianReadout2d(FullGaussian2d):
             grid = grid + shift[:, None, None, :]
 
         y = F.grid_sample(x, grid, align_corners=self.align_corners)
+        feature_vecs = y.transpose(1, 2).squeeze(3)
 
         if self.return_weighted_features:
             return y.squeeze(-1).unsqueeze(0) * feat
@@ -743,7 +744,7 @@ class GeneralizedFullGaussianReadout2d(FullGaussian2d):
 
         if self.bias is not None:
             y = y + bias.unsqueeze(1)
-        return y.squeeze()
+        return y.squeeze(), feature_vecs
 
     def initialize_bias(self, mean_activity=None):
         """

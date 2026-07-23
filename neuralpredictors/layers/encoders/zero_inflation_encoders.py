@@ -24,6 +24,7 @@ class ZeroInflationEncoderBase(Encoder):
         offset=1.0e-6,
         shifter=None,
         modulator=None,
+        whitener=None,
     ):
 
         super().__init__()
@@ -31,6 +32,7 @@ class ZeroInflationEncoderBase(Encoder):
         self.readout = readout
         self.shifter = shifter
         self.modulator = modulator
+        self.whitener = whitener
         self.offset = offset
         self.zero_thresholds = zero_thresholds
 
@@ -93,15 +95,16 @@ class ZeroInflationEncoderBase(Encoder):
         if detach_core:
             x = x.detach()
 
-        if self.shifter:
-            if pupil_center is None:
-                raise ValueError("pupil_center is not given")
+        if self.shifter and pupil_center is not None and shift is None:
             shift = self.shifter[data_key](pupil_center, trial_idx)
 
         if "sample" in kwargs:
-            x = self.readout(x, data_key=data_key, sample=kwargs["sample"], shift=shift)
+            x, feature_vecs = self.readout(x, data_key=data_key, sample=kwargs["sample"], shift=shift)
         else:
-            x = self.readout(x, data_key=data_key, shift=shift)
+            x, feature_vecs = self.readout(x, data_key=data_key, shift=shift)
+
+        if self.whitener and self.training:
+            self.whitener.update(feature_vecs)
 
         # keep batch dimension if only one image was passed
         params = []
@@ -142,10 +145,19 @@ class ZIGEncoder(ZeroInflationEncoderBase):
         offset=1.0e-6,
         shifter=None,
         modulator=None,
+        whitener=None,
     ):
 
         super().__init__(
-            core, readout, zero_thresholds, loc_image_dependent, q_image_dependent, offset, shifter, modulator
+            core,
+            readout,
+            zero_thresholds,
+            loc_image_dependent,
+            q_image_dependent,
+            offset,
+            shifter,
+            modulator,
+            whitener=whitener,
         )
 
         if not theta_image_dependent:
@@ -244,10 +256,19 @@ class ZILEncoder(ZeroInflationEncoderBase):
         offset=1.0e-12,
         shifter=None,
         modulator=None,
+        whitener=None,
     ):
 
         super().__init__(
-            core, readout, zero_thresholds, loc_image_dependent, q_image_dependent, offset, shifter, modulator
+            core,
+            readout,
+            zero_thresholds,
+            loc_image_dependent,
+            q_image_dependent,
+            offset,
+            shifter,
+            modulator,
+            whitener=whitener,
         )
 
         if not mu_image_dependent:
