@@ -271,6 +271,111 @@ class Factorized2d(Readout):
         return y, feature_vecs
 
 
+class GeneralizedFactorized2d(Factorized2d):
+    def __init__(self, in_shape, outdims, bias, inferred_params_n=1, **kwargs):
+        """
+        Generalized version of Factorized2d that predicts `inferred_params_n` image-dependent
+        numbers per neuron instead of 1 (e.g. q, theta for the ZIG loss).
+        """
+        self.inferred_params_n = inferred_params_n
+        super().__init__(in_shape, outdims, bias, **kwargs)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(inferred_params_n, outdims))
+        else:
+            self.register_parameter("bias", None)
+
+    def initialize_features(self, match_ids=None, shared_features=None):
+        c = self.in_shape[0]
+        if match_ids is not None:
+            assert self.outdims == len(match_ids)
+
+            n_match_ids = len(np.unique(match_ids))
+            if shared_features is not None:
+                assert shared_features.shape == (
+                    self.inferred_params_n,
+                    n_match_ids,
+                    c,
+                ), f"shared features need to have shape ({self.inferred_params_n}, {n_match_ids}, {c})"
+                self._features = shared_features
+                self._original_features = False
+            else:
+                self._features = nn.Parameter(torch.Tensor(self.inferred_params_n, n_match_ids, c))
+            self.scales = nn.Parameter(torch.Tensor(self.inferred_params_n, self.outdims, 1))
+            _, sharing_idx = np.unique(match_ids, return_inverse=True)
+            self.register_buffer("feature_sharing_index", torch.from_numpy(sharing_idx))
+            self._shared_features = True
+        else:
+            self._features = nn.Parameter(
+                torch.randn(self.inferred_params_n, self.outdims, c) * self.init_noise
+            )
+            self._shared_features = False
+
+    @property
+    def features(self):
+        if self._shared_features:
+            return self.scales * self._features[:, self.feature_sharing_index, :]
+        else:
+            return self._features
+
+    def forward(self, x, shift=None, **kwargs):
+        c, h, w = x.size()[1:]
+        c_in, h_in, w_in = self.in_shape
+        if (c_in, w_in, h_in) != (c, w, h):
+            raise ValueError("the specified feature map dimension is not the readout's expected input dimension")
+
+        if shift is not None:
+            x = shift_feature_maps(x, shift)
+
+        feature_vecs = torch.einsum("bchw,nhw->bnc", x, self.spatial)  # spatial RF shared across params
+        y = torch.einsum("bnc,pnc->pbn", feature_vecs, self.features)
+        if self.bias is not None:
+            y = y + self.bias.unsqueeze(1)
+        return y.squeeze(), feature_vecs
+
+    def initialize_bias(self, mean_activity=None):
+        if mean_activity is None:
+            warnings.warn("Readout is NOT initialized with mean activity but with 0!")
+            self.bias.data.fill_(0)
+        else:
+            self.bias.data = mean_activity.repeat(self.bias.shape[0], 1)
+
+    def feature_l1(self, whitener=None, reduction="sum", average=None):
+        """
+        Returns l1 regularization term for features. Whitening is applied per param-head, since
+        Factorized2d stores outdims before the channel axis (unlike FullGaussian2d), so a plain
+        self.features.T does not line up the channel axis for Whitener.transform_weights.
+        """
+        if self._original_features:
+            if whitener:
+                features = torch.stack(
+                    [whitener.transform_weights(self.features[p].T).T for p in range(self.inferred_params_n)]
+                )
+            else:
+                features = self.features
+
+            return self.apply_reduction(features.abs(), reduction=reduction, average=average)
+        else:
+            return 0
+
+    def adaptive_feature_l1_lognorm(self, whitener=None, reduction="sum", average=None):
+        if self._original_features:
+            if whitener:
+                features = torch.stack(
+                    [whitener.transform_weights(self.features[p].T).T for p in range(self.inferred_params_n)]
+                )
+            else:
+                features = self.features
+
+            features = self.adaptive_neuron_reg_coefs.abs() * features
+            features_regularization = (
+                self.apply_reduction(features.abs(), reduction=reduction, average=average) * self.feature_reg_weight
+            )
+            coef_prior = 1 / (self.gamma_sigma**2) * ((torch.log(self.adaptive_neuron_reg_coefs.abs()) ** 2).sum())
+            return features_regularization + coef_prior
+        else:
+            return 0
+
+
 class LegacyFullFactorized2d(Readout):
     """
     Factorized fully connected layer. Weights are a sum of outer products between a spatial filter and a feature vector.
