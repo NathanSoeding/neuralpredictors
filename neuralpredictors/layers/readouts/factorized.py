@@ -9,6 +9,42 @@ from torch.nn import functional as F
 from .base import Readout
 
 
+def peak_distance_penalty(m, radius=8.0, chunk=8192):
+    """m: (n, h, w) softmax-normalized masks."""
+    n, h, w = m.shape
+    ar_h = torch.arange(h, device=m.device, dtype=m.dtype)
+    ar_w = torch.arange(w, device=m.device, dtype=m.dtype)
+    total = m.new_zeros(())
+    for s in range(0, n, chunk):
+        mc = m[s:s + chunk]
+        b = mc.shape[0]
+        idx = mc.reshape(b, -1).argmax(1)
+        py = (idx // w).to(m.dtype)
+        px = (idx % w).to(m.dtype)
+        dy2 = (ar_h[None, :] - py[:, None]) ** 2          # (b, h)
+        dx2 = (ar_w[None, :] - px[:, None]) ** 2          # (b, w)
+        d = (dy2[:, :, None] + dx2[:, None, :]).sqrt()    # (b, h, w)
+        total = total + (mc * F.relu(d - radius) ** 2).sum()
+    return total / n
+
+
+def concavity_penalty(b, W, lim, eps=1e-8):
+    """b: (1,h,w) or (h,w) smoothed bias. W: (in_dim,h,w) smoothed ramps.
+    lim: (in_dim,) = source_grid.abs().max(0).values."""
+    b = b.reshape(b.shape[-2], b.shape[-1])
+    signs = torch.cartesian_prod(*[torch.tensor([-1.0, 1.0], device=b.device)] * W.shape[0])
+    signs = signs.reshape(-1, W.shape[0])                       # (2^d, d)
+    rf = b[None] + torch.einsum("cd,dhw->chw", signs * lim[None], W)
+
+    fxx = rf[:, 1:-1, 2:] - 2 * rf[:, 1:-1, 1:-1] + rf[:, 1:-1, :-2]
+    fyy = rf[:, 2:, 1:-1] - 2 * rf[:, 1:-1, 1:-1] + rf[:, :-2, 1:-1]
+    fxy = (rf[:, 2:, 2:] - rf[:, 2:, :-2] - rf[:, :-2, 2:] + rf[:, :-2, :-2]) / 4
+
+    tr, diff = (fxx + fyy) / 2, (fxx - fyy) / 2
+    lmax = tr + (diff ** 2 + fxy ** 2 + eps).sqrt()             # larger Hessian eigenvalue
+    return F.relu(lmax).pow(2).mean()
+
+
 def shift_feature_maps(x, shifts):
     """
     x:      (B, C, H, W)
@@ -60,6 +96,9 @@ class Factorized2d(Readout):
         kernel_size=7,
         kernel_sigma=2.0,
         smoothness_reg_weight=0.0,
+        peak_distance_reg_weight=0.0,
+        peak_distance_radius=8.0,
+        concavity_reg_weight=0.0,
         **kwargs,
     ):
         
@@ -97,6 +136,13 @@ class Factorized2d(Readout):
             self.kernel_sigma = nn.Parameter(torch.tensor(float(kernel_sigma)))
         else:
             self.kernel_sigma = kernel_sigma
+
+        self._peak_distance_reg = peak_distance_reg_weight > 0.0
+        self.peak_distance_reg_weight = peak_distance_reg_weight
+        self.peak_distance_radius = peak_distance_radius
+
+        self._concavity_reg = concavity_reg_weight > 0.0
+        self.concavity_reg_weight = concavity_reg_weight
 
         if source_grid is None:
             raise ValueError("factorized readout needs source grid for retinotopy mapping")
@@ -208,10 +254,26 @@ class Factorized2d(Readout):
         if self._smoothness_reg:
             smoothness_reg = self.exponential_smoothness()
 
-        reg = feature_reg + smoothness_reg
+        peak_distance_reg = 0
+        if self._peak_distance_reg:
+            peak_distance_reg = peak_distance_penalty(
+                self.spatial, radius=self.peak_distance_radius
+            ) * self.peak_distance_reg_weight
+
+        concavity_reg = 0
+        if self._concavity_reg:
+            kernel = self.gaussian_kernel(self.spatial_b.device)
+            b_smooth = self.smooth(self.spatial_b, kernel)
+            W_smooth = self.smooth(self.spatial_w, kernel)
+            lim = self.source_grid.abs().max(dim=0).values
+            concavity_reg = concavity_penalty(b_smooth, W_smooth, lim) * self.concavity_reg_weight
+
+        reg = feature_reg + smoothness_reg + peak_distance_reg + concavity_reg
         components = {
-            'feature': feature_reg, 
-            'smoothness': smoothness_reg, 
+            'feature': feature_reg,
+            'smoothness': smoothness_reg,
+            'peak_distance': peak_distance_reg,
+            'concavity': concavity_reg,
         }
         return reg, components
 
