@@ -271,6 +271,240 @@ class Factorized2d(Readout):
         return y, feature_vecs
 
 
+class GaussianRetinaMean(Readout):
+    """
+    A readout whose per-neuron receptive field is a 2d Gaussian mask evaluated on the core's spatial
+    grid, similar in spirit to `FullGaussian2d` but without the sampling/grid_sample machinery.
+
+    The Gaussian's mean is not a free parameter: it is predicted from the neuron's retinotopic (x, y)
+    position (the first two columns of `source_grid`; any further columns, e.g. z/depth, are ignored)
+    through a single `nn.Linear(2, 2)` layer. That layer is shared across all neurons of this readout
+    (i.e. within one session). Each neuron additionally learns its own 2x2 covariance (as in
+    `FullGaussian2d`'s `gauss_type='full'`). The resulting Gaussian density, evaluated over the core's
+    (h, w) grid, is normalized to sum to 1 and used as the spatial pooling mask over the core output
+    (as in `Factorized2d`), followed by a per-neuron linear combination over channels.
+
+    Args:
+        in_shape (Sequence[int]): shape of the input feature map [channels, height, width]
+        outdims (int): number of output units
+        bias (bool): adds a bias term
+        source_grid (numpy.array): neuron positions, shape (outdims, >=2). Only the first two columns
+            (x, y) are used; a third column (e.g. z) is ignored.
+        init_noise (float): std used to initialize the feature weights
+        init_sigma (float): the covariance square-root (Cholesky-like factor) is initialized with
+            Uniform([-init_sigma, init_sigma])
+        shared_features (dict): see `Factorized2d`
+        feature_reg_weight / gamma_readout (float): L1 regularization weight for the features
+        regularizer_type (str): 'l1' or 'adaptive_log_norm'
+    """
+
+    def __init__(
+        self,
+        in_shape,  # channels, height, width
+        outdims,
+        bias,
+        source_grid=None,
+        init_noise=1e-3,
+        init_sigma=1.0,
+        shared_features=None,
+        mean_activity=None,
+        feature_reg_weight=None,
+        gamma_readout=None,
+        regularizer_type="l1",
+        gamma_sigma=0.1,
+        **kwargs,
+    ):
+        super().__init__()
+
+        h, w = in_shape[1:]  # channels, height, width
+        self.in_shape = in_shape
+        self.outdims = outdims
+
+        self._regularizer_type = regularizer_type
+        if self._regularizer_type == "adaptive_log_norm":
+            self.gamma_sigma = gamma_sigma
+            self.adaptive_neuron_reg_coefs = nn.Parameter(torch.randn(outdims, 1) + 1)
+        elif self._regularizer_type != "l1":
+            raise ValueError(f"regularizer_type should be 'l1' or 'adaptive_log_norm' but got {self._regularizer_type}")
+
+        self.init_noise = init_noise
+        self.mean_activity = mean_activity
+        self.feature_reg_weight = self.resolve_deprecated_gamma_readout(
+            feature_reg_weight, gamma_readout, default=1.0
+        )
+        self._original_features = True
+        self.initialize_features(**(shared_features or {}))
+
+        if source_grid is None:
+            raise ValueError("GaussianRetinaMean readout needs a source grid of neuron (x, y, ...) positions")
+        if source_grid.shape[1] < 2:
+            raise ValueError("source_grid must have at least 2 columns (x, y)")
+
+        xy_grid = source_grid[:, :2]  # drop z (and any further columns)
+        xy_grid = xy_grid - xy_grid.mean(axis=0, keepdims=True)
+        xy_grid = xy_grid / np.abs(xy_grid).max()
+        self.register_buffer("source_grid_xy", torch.from_numpy(xy_grid.astype(np.float32)))
+
+        # linear map from neuron (x, y) retinotopic position to its predicted RF center (x', y'),
+        # shared across all neurons of this readout (i.e. within one session)
+        self.mu_transform = nn.Linear(2, 2)
+
+        # per-neuron covariance square-root, as in FullGaussian2d(gauss_type="full")
+        self.init_sigma = init_sigma
+        self.sigma = nn.Parameter(torch.Tensor(outdims, 2, 2))
+
+        ys = torch.linspace(-1, 1, h)
+        xs = torch.linspace(-1, 1, w)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        self.register_buffer("grid", torch.stack((xx, yy), dim=-1))  # (h, w, 2)
+
+        if bias:
+            bias = nn.Parameter(torch.Tensor(outdims))
+            self.register_parameter("bias", bias)
+        else:
+            self.register_parameter("bias", None)
+
+        self.initialize()
+
+    def initialize_features(self, match_ids=None, shared_features=None):
+        """
+        The internal attribute `_original_features` in this function denotes whether this instance of the FullGuassian2d
+        learns the original features (True) or if it uses a copy of the features from another instance of FullGaussian2d
+        via the `shared_features` (False). If it uses a copy, the feature_l1 regularizer for this copy will return 0
+        """
+        c = self.in_shape[0]
+        if match_ids is not None:
+            assert self.outdims == len(match_ids)
+
+            n_match_ids = len(np.unique(match_ids))
+            if shared_features is not None:
+                assert shared_features.shape == (
+                    n_match_ids,
+                    c,
+                ), f"shared features need to have shape ({n_match_ids}, {c})"
+                self._features = shared_features
+                self._original_features = False
+            else:
+                self._features = nn.Parameter(
+                    torch.Tensor(n_match_ids, c)
+                )  # feature weights for each channel of the core
+            self.scales = nn.Parameter(torch.Tensor(self.outdims, 1))  # feature weights for each channel of the core
+            _, sharing_idx = np.unique(match_ids, return_inverse=True)
+            self.register_buffer("feature_sharing_index", torch.from_numpy(sharing_idx))
+            self._shared_features = True
+        else:
+            self._features = nn.Parameter(torch.randn(self.outdims, c) * self.init_noise)  # feature weights for each channel of the core
+            self._shared_features = False
+
+    def initialize(self, mean_activity=None):
+        """
+        Initializes the mu_transform, sigma and feature weights
+        """
+        if mean_activity is None:
+            mean_activity = self.mean_activity
+        self.mu_transform.weight.data = torch.eye(2)
+        self.mu_transform.bias.data.fill_(0.0)
+        self.sigma.data.uniform_(-self.init_sigma, self.init_sigma)
+        if self._shared_features:
+            self.scales.data.fill_(1.0)
+        if self.bias is not None:
+            self.initialize_bias(mean_activity=mean_activity)
+
+    def feature_l1(self, whitener=None, reduction="sum", average=None):
+        """
+        Returns l1 regularization term for features.
+        Args:
+            average(bool): Deprecated (see reduction) if True, use mean of weights for regularization
+            reduction(str): Specifies the reduction to apply to the output: 'none' | 'mean' | 'sum'
+        """
+        if self._original_features:
+            if whitener:
+                features = whitener.transform_weights(self.features.T).T
+            else:
+                features = self.features
+
+            return self.apply_reduction(features.abs(), reduction=reduction, average=average)
+        else:
+            return 0
+
+    def adaptive_feature_l1_lognorm(self, whitener=None, reduction="sum", average=None):
+        if self._original_features:
+            if whitener:
+                features = whitener.transform_weights(self.features.T).T
+            else:
+                features = self.features
+
+            features = self.adaptive_neuron_reg_coefs.abs() * features
+            features_regularization = (
+                self.apply_reduction(features.abs(), reduction=reduction, average=average) * self.feature_reg_weight
+            )
+            # adaptive_neuron_reg_coefs (betas) are supposted to be from lognorm distribution
+            coef_prior = 1 / (self.gamma_sigma**2) * ((torch.log(self.adaptive_neuron_reg_coefs.abs()) ** 2).sum())
+            return features_regularization + coef_prior
+        else:
+            return 0
+
+    def regularizer(self, whitener=None, reduction="sum", average=None):
+        if self._regularizer_type == "l1":
+            return self.feature_l1(whitener=whitener, reduction=reduction, average=average) * self.feature_reg_weight
+        elif self._regularizer_type == "adaptive_log_norm":
+            return self.adaptive_feature_l1_lognorm(whitener=whitener, reduction=reduction, average=average)
+        else:
+            raise NotImplementedError(f"Regularizer_type {self._regularizer_type} is not implemented")
+
+    @property
+    def mu(self):
+        return self.mu_transform(self.source_grid_xy)  # (outdims, 2), predicted (x', y') per neuron
+
+    @property
+    def covariance(self):
+        # square-root parametrization guarantees positive semi-definiteness; jitter keeps it invertible
+        cov = torch.einsum("nij,nkj->nik", self.sigma, self.sigma)
+        eps = 1e-4 * torch.eye(2, device=cov.device, dtype=cov.dtype)
+        return cov + eps
+
+    @property
+    def spatial(self):
+        mu = self.mu  # (n, 2)
+        cov = self.covariance  # (n, 2, 2)
+        cov_inv = torch.linalg.inv(cov)  # (n, 2, 2)
+
+        diff = self.grid[None] - mu[:, None, None, :]  # (n, h, w, 2)
+        maha = torch.einsum("nhwi,nij,nhwj->nhw", diff, cov_inv, diff)
+        density = torch.exp(-0.5 * maha)  # (n, h, w)
+
+        n, h, w = density.shape
+        mass = density.view(n, -1).sum(dim=1, keepdim=True) + 1e-8
+        return (density.view(n, -1) / mass).view(n, h, w)
+
+    @property
+    def shared_features(self):
+        return self._features
+
+    @property
+    def features(self):
+        if self._shared_features:
+            return self.scales * self._features[self.feature_sharing_index, ...]
+        else:
+            return self._features
+
+    def forward(self, x, shift=None, **kwargs):
+        c, h, w = x.size()[1:]
+        c_in, h_in, w_in = self.in_shape
+        if (c_in, w_in, h_in) != (c, w, h):
+            raise ValueError("the specified feature map dimension is not the readout's expected input dimension")
+
+        if shift is not None:
+            x = shift_feature_maps(x, shift)
+
+        feature_vecs = torch.einsum("bchw,nhw->bnc", x, self.spatial)
+
+        y = torch.einsum("bnc,nc->bn", feature_vecs, self.features)
+        if self.bias is not None:
+            y = y + self.bias
+        return y, feature_vecs
+
+
 class LegacyFullFactorized2d(Readout):
     """
     Factorized fully connected layer. Weights are a sum of outer products between a spatial filter and a feature vector.
