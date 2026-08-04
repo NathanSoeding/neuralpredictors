@@ -121,24 +121,81 @@ class FourierRetinotopy(nn.Module):
         logits = torch.einsum("nk,khw->nhw", coeffs, self.basis) / math.sqrt(k)
         return logits
 
+
 class GaussianRetinotopy(nn.Module):
-    def __init__(self, source_grid, out_shape, predict_sigma=False, init_sigma=0.05, sigma_range=(0.01, 0.3), hidden_features=20, hidden_layers=0, in_dim=None):
+    """
+    Predicts, for each of `n` units, a 2D Gaussian "bump" over a (h, w) output
+    grid, given each unit's (x, y) position in a `source_grid`.
+ 
+    covariance_type controls how much freedom the Gaussian's shape has:
+        - "scalar"   : single sigma -> isotropic (circular) bump. (original behavior)
+        - "diagonal" : independent sigma_x, sigma_y -> axis-aligned elliptical bump.
+        - "full"     : sigma_x, sigma_y, plus a rotation angle theta -> a genuine
+                       full 2x2 covariance matrix (an arbitrarily oriented ellipse).
+ 
+    The "full" covariance is parameterized as
+ 
+        Sigma = R(theta) @ diag(sigma_x^2, sigma_y^2) @ R(theta)^T
+ 
+    i.e. via its eigen-decomposition (rotation + two positive axis lengths).
+    This is equivalent to specifying an arbitrary 2x2 symmetric positive-definite
+    covariance matrix, but is numerically simpler than Cholesky/matrix-inverse
+    approaches: sigma_x, sigma_y > 0 is enforced directly (sigmoid/exp), and the
+    Mahalanobis distance is computed by rotating (dx, dy) into the ellipse's own
+    axes, with no matrix inversion needed.
+ 
+    If predict_sigma=True, all shape parameters (and the center) are predicted
+    per-unit by the MLP from source_grid (and optionally pupil_center).
+    If predict_sigma=False, the shape parameters are still learned independently
+    per unit -- just directly as nn.Parameter tensors of shape (n, ...) rather
+    than being predicted by the MLP. Only the center is always predicted by
+    the MLP, regardless of predict_sigma.
+    """
+ 
+    _COVARIANCE_TYPES = ("scalar", "diagonal", "full")
+    # number of extra MLP output dims needed to parameterize the covariance
+    _N_COV_PARAMS = {"scalar": 1, "diagonal": 2, "full": 3}
+ 
+    def __init__(
+        self,
+        source_grid,
+        out_shape,
+        predict_sigma=False,
+        init_sigma=0.05,
+        sigma_range=(0.01, 0.3),
+        hidden_features=20,
+        hidden_layers=0,
+        in_dim=None,
+        covariance_type="scalar",
+    ):
         super().__init__()
+ 
+        if covariance_type not in self._COVARIANCE_TYPES:
+            raise ValueError(
+                f"covariance_type must be one of {self._COVARIANCE_TYPES}, "
+                f"got {covariance_type!r}"
+            )
+        self.covariance_type = covariance_type
+ 
         source_grid = source_grid - source_grid.mean(axis=0, keepdims=True)
         source_grid = source_grid / np.abs(source_grid).max()
         self.register_buffer("source_grid", torch.from_numpy(source_grid.astype(np.float32)))
-
+ 
         self.out_shape = out_shape
         n, h, w = self.out_shape
         self.predict_sigma = predict_sigma
         self.sigma_range = sigma_range
-
+ 
         in_dim = source_grid.shape[1] if in_dim is None else in_dim
         self.inp_dim = in_dim
-
-        # output dim: 2 for (x, y) center, +1 more if predicting sigma
-        out_dim = 3 if predict_sigma else 2
-
+ 
+        n_cov_params = self._N_COV_PARAMS[covariance_type]
+        self.n_cov_params = n_cov_params
+ 
+        # output dim: 2 for (x, y) center, + covariance params only if they are
+        # predicted per-unit by the MLP
+        out_dim = 2 + n_cov_params if predict_sigma else 2
+ 
         layers = []
         for hidden_dim in [hidden_features] * hidden_layers:
             layers.append(nn.Linear(in_dim, hidden_dim))
@@ -146,54 +203,120 @@ class GaussianRetinotopy(nn.Module):
             in_dim = hidden_dim
         layers.append(nn.Linear(in_dim, out_dim))
         self.mlp = nn.Sequential(*layers)
-
+ 
         if not predict_sigma:
-            # fixed, learnable scalar sigma (in normalized [-1,1] coord units)
-            self.log_sigma = nn.Parameter(torch.log(torch.tensor(float(init_sigma))))
-
+            # fixed, learnable covariance parameters -- one independent set per unit
+            init_log_sigma = torch.log(torch.tensor(float(init_sigma)))
+            if covariance_type == "scalar":
+                self.log_sigma = nn.Parameter(init_log_sigma.expand(n).clone())
+                print(self.log_sigma.shape)
+            elif covariance_type == "diagonal":
+                self.log_sigma = nn.Parameter(init_log_sigma.expand(n, 2).clone())
+                print(self.log_sigma.shape)
+            else:  # "full"
+                self.log_sigma = nn.Parameter(init_log_sigma.expand(n, 2).clone())
+                self.theta_raw = nn.Parameter(torch.zeros(n))
+                print(self.log_sigma.shape)
+                print(self.theta_raw.shape)
+ 
         # precompute pixel grid once (buffers, not parameters)
         ys = torch.linspace(-1, 1, h) * (h / max(h, w))
         xs = torch.linspace(-1, 1, w) * (w / max(h, w))
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')  # (h, w)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")  # (h, w)
         self.register_buffer("grid_x", grid_x.clone())
         self.register_buffer("grid_y", grid_y.clone())
-
-    def forward(self, pupil_center=None):
+ 
+    def _get_sigma_xy(self, out, n):
+        """Returns (sigma_x, sigma_y), each shape (n,), constrained to sigma_range."""
+        lo, hi = self.sigma_range
+        if self.predict_sigma:
+            sigma_x = lo + (hi - lo) * torch.sigmoid(out[:, 2])
+            sigma_y = lo + (hi - lo) * torch.sigmoid(out[:, 3])
+        else:
+            sigma_x = self.log_sigma[:, 0].exp()
+            sigma_y = self.log_sigma[:, 1].exp()
+        return sigma_x, sigma_y
+ 
+    def _get_theta(self, out, n):
+        """Returns rotation angle theta, shape (n,), squashed to (-pi/2, pi/2).
+ 
+        Squashing to a half-turn is sufficient (not just sufficient, but exactly
+        right): rotating an axis-aligned ellipse by pi is indistinguishable from
+        not rotating it at all, so (-pi/2, pi/2) already covers every unique
+        orientation, and keeping it bounded avoids unbounded drift / angle-wrap
+        discontinuities during optimization.
+        """
+        if self.predict_sigma:
+            theta_raw = out[:, 4]
+        else:
+            theta_raw = self.theta_raw
+        return (math.pi / 2) * torch.tanh(theta_raw)
+ 
+    def forward(self, pupil_center=None, return_params=False):
         n, _ = self.source_grid.shape
-
+ 
         if pupil_center is not None:
-            combined = torch.cat([
-                self.source_grid,
-                pupil_center.unsqueeze(0).expand(n, -1),
-            ], dim=-1)
+            combined = torch.cat(
+                [self.source_grid, pupil_center.unsqueeze(0).expand(n, -1)], dim=-1
+            )
             out = self.mlp(combined)  # n, out_dim
         else:
             out = self.mlp(self.source_grid)  # n, out_dim
-
+ 
         # center coords, squashed to [-1, 1]
         center = torch.tanh(out[:, :2])  # n, 2  (x, y)
-
+ 
         h, w = self.out_shape[1], self.out_shape[2]
         scale = torch.tensor([w, h], dtype=center.dtype, device=center.device) / max(h, w)
         center = center * scale  # now in same coordinate space as grid_x/grid_y
-
-        if self.predict_sigma:
-            lo, hi = self.sigma_range
-            sigma = lo + (hi - lo) * torch.sigmoid(out[:, 2])  # n,
-        else:
-            sigma = self.log_sigma.exp().expand(n)  # n,
-
+ 
         px = center[:, 0].view(n, 1, 1)  # (n,1,1)
         py = center[:, 1].view(n, 1, 1)
-        sigma = sigma.view(n, 1, 1)
-
-        grid_x = self.grid_x.unsqueeze(0)  # (1,h,w)
-        grid_y = self.grid_y.unsqueeze(0)
-
-        dist_sq = (grid_x - px) ** 2 + (grid_y - py) ** 2
-        logits = -dist_sq / (2 * sigma ** 2)  # log-gaussian, unnormalized (peak at 0)
-
+ 
+        dx = self.grid_x.unsqueeze(0) - px  # (n,h,w)
+        dy = self.grid_y.unsqueeze(0) - py  # (n,h,w)
+ 
+        params = {"center": center}
+ 
+        if self.covariance_type == "scalar":
+            if self.predict_sigma:
+                lo, hi = self.sigma_range
+                sigma = lo + (hi - lo) * torch.sigmoid(out[:, 2])  # n,
+            else:
+                sigma = self.log_sigma.exp()  # n,
+            sigma_ = sigma.view(n, 1, 1)
+            mahalanobis_sq = (dx ** 2 + dy ** 2) / sigma_ ** 2
+            params["sigma"] = sigma
+ 
+        elif self.covariance_type == "diagonal":
+            sigma_x, sigma_y = self._get_sigma_xy(out, n)
+            sigma_x_ = sigma_x.view(n, 1, 1)
+            sigma_y_ = sigma_y.view(n, 1, 1)
+            mahalanobis_sq = (dx / sigma_x_) ** 2 + (dy / sigma_y_) ** 2
+            params["sigma_x"], params["sigma_y"] = sigma_x, sigma_y
+ 
+        else:  # "full": anisotropic + rotated -> genuine 2x2 covariance
+            sigma_x, sigma_y = self._get_sigma_xy(out, n)
+            theta = self._get_theta(out, n)  # n,
+ 
+            cos_t = torch.cos(theta).view(n, 1, 1)
+            sin_t = torch.sin(theta).view(n, 1, 1)
+            sigma_x_ = sigma_x.view(n, 1, 1)
+            sigma_y_ = sigma_y.view(n, 1, 1)
+ 
+            # rotate (dx, dy) into the ellipse's own principal-axis frame
+            dx_rot = dx * cos_t + dy * sin_t
+            dy_rot = -dx * sin_t + dy * cos_t
+ 
+            mahalanobis_sq = (dx_rot / sigma_x_) ** 2 + (dy_rot / sigma_y_) ** 2
+            params["sigma_x"], params["sigma_y"], params["theta"] = sigma_x, sigma_y, theta
+ 
+        logits = -0.5 * mahalanobis_sq  # log-gaussian, unnormalized (peak at 0)
+ 
+        if return_params:
+            return logits, params
         return logits
+
 
 class DiscretizedRetinotopy(nn.Module):
     def __init__(self, source_grid, out_shape, kernel_size=7, sigma=2.0, in_dim=None):
@@ -323,6 +446,7 @@ class FullFactorized2d(Readout):
         gaussian_spatial=False,
         predict_sigma=False,
         init_sigma=1.0,
+        covariance_type='scalar',
         discretized_spatial=False,
         kernel_size=7,
         sigma=2.0,
@@ -411,7 +535,7 @@ class FullFactorized2d(Readout):
         elif retinotopy_spatial is not None and gaussian_spatial:
             self._retinotopy = True
             self._gaussian = True
-            self.retinotopy_spatial = GaussianRetinotopy(source_grid, (self.outdims, h, w), predict_sigma, init_sigma, **retinotopy_spatial)
+            self.retinotopy_spatial = GaussianRetinotopy(source_grid, (self.outdims, h, w), predict_sigma, init_sigma, covariance_type=covariance_type, **retinotopy_spatial)
         elif retinotopy_spatial is not None and discretized_spatial:
             self._retinotopy = True
             self._discretized = True

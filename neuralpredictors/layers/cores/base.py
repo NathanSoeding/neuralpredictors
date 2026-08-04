@@ -72,7 +72,7 @@ class ConvCore(Core):
         self.bias_layer_cls = None
         self.scale_layer_cls = None
 
-    def add_bn_layer(self, layer: OrderedDict, layer_idx: int):
+    def add_bn_layer(self, layer: OrderedDict, layer_idx: int, track_running_stats: bool):
         for attr in ["batch_norm", "hidden_channels", "momentum", "bias", "batch_norm_scale"]:
             if not hasattr(self, attr):
                 raise NotImplementedError(f"Subclasses must have a `{attr}` attribute.")
@@ -87,7 +87,7 @@ class ConvCore(Core):
             bias = self.bias[layer_idx]
             scale = self.batch_norm_scale[layer_idx]
 
-            layer["norm"] = self.batchnorm_layer_cls(hidden_channels, momentum=self.momentum, affine=bias and scale)
+            layer["norm"] = self.batchnorm_layer_cls(hidden_channels, momentum=self.momentum, affine=bias and scale, track_running_stats=track_running_stats)
             if bias and not scale:
                 layer["bias"] = self.bias_layer_cls(hidden_channels)
             elif not bias and scale:

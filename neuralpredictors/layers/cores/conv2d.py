@@ -71,6 +71,7 @@ class Stacked2dCore(ConvCore, nn.Module):
         linear=False,
         nonlinearity_type="AdaptiveELU",
         nonlinearity_config=None,
+        track_running_stats=False,
     ):
         """
         Args:
@@ -127,6 +128,7 @@ class Stacked2dCore(ConvCore, nn.Module):
         else:
             logger.warning("Passed `batch_norm_scale` as an iterable, ignoring `final_batchnorm_scale`.")
             self.batch_norm_scale = batch_norm_scale
+        self.track_running_stats = track_running_stats
 
         self.bias = bias if isinstance(bias, Iterable) else [bias] * layers
 
@@ -224,7 +226,7 @@ class Stacked2dCore(ConvCore, nn.Module):
             padding=self.input_kern // 2 if self.pad_input else 0,
             bias=self.bias and not self.batch_norm,
         )
-        self.add_bn_layer(layer, 0)
+        self.add_bn_layer(layer, 0, self.track_running_stats)
         self.add_activation(layer)
         self.features.add_module("layer0", nn.Sequential(layer))
 
@@ -249,7 +251,7 @@ class Stacked2dCore(ConvCore, nn.Module):
             layer = OrderedDict()
 
             self.add_subsequent_conv_layer(layer, l)
-            self.add_bn_layer(layer, l)
+            self.add_bn_layer(layer, l, self.track_running_stats)
             self.add_activation(layer)
             self.features.add_module("layer{}".format(l), nn.Sequential(layer))
 
