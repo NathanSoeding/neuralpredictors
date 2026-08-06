@@ -200,34 +200,32 @@ class Factorized2d(Readout):
     def exponential_smoothness(self):
         return torch.exp(-self.kernel_sigma) * self.smoothness_reg_weight
 
-    def spatial_entropy(self, reduction="sum", average=None, eps=1e5):
+    def spatial_entropy(self, reduction="sum", average=None, eps=1e-5):
         spatial = self.spatial
         entropy = -(spatial * (spatial + eps).log()).sum(dim=(1, 2))
-        entropy_regularization = self.apply_reduction(entropy, reduction=reduction, average=average) * self.entropy_reg_weight
+        return self.apply_reduction(entropy, reduction=reduction, average=average) * self.entropy_reg_weight
 
     def regularizer(self, whitener=None, reduction="sum", average=None):
-        feature_reg = 0
         if self._regularizer_type == "l1":
             feature_reg = self.feature_l1(whitener=whitener, reduction=reduction, average=average) * self.feature_reg_weight
         elif self._regularizer_type == "adaptive_log_norm":
             feature_reg = self.adaptive_feature_l1_lognorm(whitener=whitener, reduction=reduction, average=average)
         else:
             raise NotImplementedError(f"Regularizer_type {self._regularizer_type} is not implemented")
+
+        components = {'feature': feature_reg}
         
         smoothness_reg = 0
         if self._smoothness_reg:
             smoothness_reg = self.exponential_smoothness()
+            components['smoothness'] = smoothness_reg
 
         entropy_reg = 0
         if self._entropy_reg:
-            entropy_reg = self.spatial_entropy()
+            entropy_reg = self.spatial_entropy(reduction=reduction, average=average)
+            components['entropy'] = entropy_reg
 
         reg = feature_reg + smoothness_reg + entropy_reg
-        components = {
-            'feature': feature_reg, 
-            'smoothness': smoothness_reg, 
-            'entropy': entropy_reg,
-        }
         return reg, components
 
     def gaussian_kernel(self, device):
