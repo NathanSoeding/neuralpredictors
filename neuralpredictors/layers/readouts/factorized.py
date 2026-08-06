@@ -200,7 +200,7 @@ class Factorized2d(Readout):
     def exponential_smoothness(self):
         return torch.exp(-self.kernel_sigma) * self.smoothness_reg_weight
 
-    def spatial_entropy(self, reduction="sum", average=average, eps=1e5):
+    def spatial_entropy(self, reduction="sum", average=None, eps=1e5):
         spatial = self.spatial
         entropy = -(spatial * (spatial + eps).log()).sum(dim=(1, 2))
         entropy_regularization = self.apply_reduction(entropy, reduction=reduction, average=average) * self.entropy_reg_weight
