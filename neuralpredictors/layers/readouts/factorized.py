@@ -60,6 +60,7 @@ class Factorized2d(Readout):
         kernel_size=7,
         kernel_sigma=2.0,
         smoothness_reg_weight=0.0,
+        entropy_reg_weight=0.0,
         **kwargs,
     ):
         
@@ -97,6 +98,10 @@ class Factorized2d(Readout):
             self.kernel_sigma = nn.Parameter(torch.tensor(float(kernel_sigma)))
         else:
             self.kernel_sigma = kernel_sigma
+        
+        self._entropy_reg = entropy_reg_weight > 0.0
+        if self._entropy_reg:
+            self.entropy_reg_weight = entropy_reg_weight
 
         if source_grid is None:
             raise ValueError("factorized readout needs source grid for retinotopy mapping")
@@ -195,6 +200,11 @@ class Factorized2d(Readout):
     def exponential_smoothness(self):
         return torch.exp(-self.kernel_sigma) * self.smoothness_reg_weight
 
+    def spatial_entropy(self, reduction="sum", average=average, eps=1e5):
+        spatial = self.spatial
+        entropy = -(spatial * (spatial + eps).log()).sum(dim=(1, 2))
+        entropy_regularization = self.apply_reduction(entropy, reduction=reduction, average=average) * self.entropy_reg_weight
+
     def regularizer(self, whitener=None, reduction="sum", average=None):
         feature_reg = 0
         if self._regularizer_type == "l1":
@@ -208,10 +218,15 @@ class Factorized2d(Readout):
         if self._smoothness_reg:
             smoothness_reg = self.exponential_smoothness()
 
-        reg = feature_reg + smoothness_reg
+        entropy_reg = 0
+        if self._entropy_reg:
+            entropy_reg = self.spatial_entropy()
+
+        reg = feature_reg + smoothness_reg + entropy_reg
         components = {
             'feature': feature_reg, 
             'smoothness': smoothness_reg, 
+            'entropy': entropy_reg,
         }
         return reg, components
 
