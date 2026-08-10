@@ -65,6 +65,7 @@ class FiringRateEncoder(Encoder):
         trial_idx=None,
         shift=None,
         detach_core=False,
+        return_vec=False,
         **kwargs
     ):
         x = inputs
@@ -98,9 +99,15 @@ class FiringRateEncoder(Encoder):
             x = self.modulator[data_key](x, behavior=behavior)
 
         if self.nonlinearity_type == "elu":
-            return self.nonlinearity_fn(x + self.offset) + 1
+            if return_vec:
+                return self.nonlinearity_fn(x + self.offset) + 1, feature_vecs
+            else: 
+                return self.nonlinearity_fn(x + self.offset) + 1
         else:
-            return self.nonlinearity_fn(x)
+            if return_vec:
+                return self.nonlinearity_fn(x), feature_vecs
+            else:
+                return self.nonlinearity_fn(x)
 
     def predict_mean(self, x, *args, data_key=None, **kwargs):
         return self.forward(x, *args, data_key=data_key, **kwargs)
