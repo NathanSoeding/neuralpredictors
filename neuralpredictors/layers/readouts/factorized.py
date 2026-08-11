@@ -55,6 +55,7 @@ class Factorized2d(Readout):
         regularizer_type="l1",
         gamma_sigma=0.1,
         source_grid=None,
+        spatial_init_noise=1.0,
         temperature=1.0,
         temp_per_neuron=False,
         kernel_size=7,
@@ -111,7 +112,7 @@ class Factorized2d(Readout):
         self.register_buffer("source_grid", torch.from_numpy(source_grid.astype(np.float32)))
 
         in_dim = source_grid.shape[1]
-        self.spatial_w = nn.Parameter(torch.randn(in_dim, h, w))
+        self.spatial_w = nn.Parameter(torch.randn(in_dim, h, w) * spatial_init_noise)
         self.spatial_b = nn.Parameter(torch.zeros((1, h, w)))
     
         if bias:
