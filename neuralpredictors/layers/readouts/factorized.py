@@ -99,6 +99,8 @@ class Factorized2d(Readout):
             self.kernel_sigma = nn.Parameter(torch.tensor(float(kernel_sigma)))
         else:
             self.kernel_sigma = kernel_sigma
+            # sigma is fixed -> kernel is fixed -> build it once instead of every forward
+            self.register_buffer("_fixed_kernel", self._build_gaussian_kernel(self.kernel_sigma))
         
         self._entropy_reg = entropy_reg_weight > 0.0
         if self._entropy_reg:
@@ -229,12 +231,17 @@ class Factorized2d(Readout):
         reg = feature_reg + smoothness_reg + entropy_reg
         return reg, components
 
-    def gaussian_kernel(self, device):
+    def _build_gaussian_kernel(self, sigma, device=None):
         x = torch.arange(self.kernel_size, device=device) - self.kernel_size // 2
         xx, yy = torch.meshgrid(x, x, indexing="ij")
-        kernel = torch.exp(-(xx**2 + yy**2) / (2 * self.kernel_sigma**2))
+        kernel = torch.exp(-(xx**2 + yy**2) / (2 * sigma**2))
         kernel = kernel / kernel.sum()
         return kernel.view(1, 1, self.kernel_size, self.kernel_size)
+
+    def gaussian_kernel(self, device):
+        if self._smoothness_reg:
+            return self._build_gaussian_kernel(self.kernel_sigma, device=device)
+        return self._fixed_kernel
 
     def smooth(self, x, kernel):
         x = F.pad(x, (self.kernel_size // 2, ) * 4, mode='reflect')  # pad to preserve dimentions
