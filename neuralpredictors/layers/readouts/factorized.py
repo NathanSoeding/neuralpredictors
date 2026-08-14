@@ -244,7 +244,10 @@ class Factorized2d(Readout):
         return self._fixed_kernel
 
     def smooth(self, x, kernel):
-        x = F.pad(x, (self.kernel_size // 2, ) * 4, mode='reflect')  # pad to preserve dimentions
+        pad = (self.kernel_size // 2, ) * 4
+        reflect = F.pad(x, pad, mode="reflect")
+        zero = F.pad(x, pad, mode="constant", value=0)
+        x = zero + (reflect - zero).detach()  # Trick to stop gradient flow to the padded areas
         x = F.conv2d(x.unsqueeze(1), kernel).squeeze(1)
         return x
     
