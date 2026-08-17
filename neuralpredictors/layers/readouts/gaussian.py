@@ -387,7 +387,7 @@ class FullGaussian2d(Readout):
             reduction(str): Specifies the reduction to apply to the output: 'none' | 'mean' | 'sum'
         """
         if self._original_features:
-            if whitener:
+            if whitener is not None and whitener.mode == 'ema':
                 features = whitener.transform_weights(self.features.squeeze())[None, :, None, :]
             else:
                 features = self.features
@@ -398,7 +398,7 @@ class FullGaussian2d(Readout):
 
     def adaptive_feature_l1_lognorm(self, whitener=None, reduction="sum", average=None):
         if self._original_features:
-            if whitener:
+            if whitener is not None and whitener.mode == 'ema':
                 features = whitener.transform_weights(self.features.squeeze())[None, :, None, :]
             else:
                 features = self.features
@@ -567,7 +567,7 @@ class FullGaussian2d(Readout):
         self.register_buffer("grid_sharing_index", torch.from_numpy(sharing_idx))
         self._shared_grid = True
 
-    def forward(self, x: torch.Tensor, sample=None, shift=None, out_idx=None, **kwargs) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, sample=None, shift=None, out_idx=None, whitener=None, **kwargs) -> torch.Tensor:
         """
         Propagates the input forwards through the readout
         Args:
@@ -612,6 +612,10 @@ class FullGaussian2d(Readout):
             grid = grid + shift[:, None, None, :]
 
         feature_vecs = F.grid_sample(x, grid, align_corners=self.align_corners)
+
+        if whitener is not None and whitener.mode == 'batch':
+            feature_vecs = whitener(feature_vecs.transpose(1, 2).squeeze(3)).unsqueeze(3).transpose(1, 2)
+
         y = (feature_vecs.squeeze(-1) * feat).sum(1).view(bs, outdims)
 
         if self.bias is not None:

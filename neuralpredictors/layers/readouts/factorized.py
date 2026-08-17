@@ -174,7 +174,7 @@ class Factorized2d(Readout):
             reduction(str): Specifies the reduction to apply to the output: 'none' | 'mean' | 'sum'
         """
         if self._original_features:
-            if whitener:
+            if whitener is not None and whitener.mode == 'ema':
                 features = whitener.transform_weights(self.features.T).T
             else:
                 features = self.features
@@ -185,7 +185,7 @@ class Factorized2d(Readout):
 
     def adaptive_feature_l1_lognorm(self, whitener=None, reduction="sum", average=None):
         if self._original_features:
-            if whitener:
+            if whitener is not None and whitener.mode == 'ema':
                 features = whitener.transform_weights(self.features.T).T
             else:
                 features = self.features
@@ -278,7 +278,7 @@ class Factorized2d(Readout):
         else:
             return self._features
 
-    def forward(self, x, shift=None, **kwargs):
+    def forward(self, x, shift=None, whitener=None, **kwargs):
         c, h, w = x.size()[1:]
         c_in, h_in, w_in = self.in_shape
         if (c_in, w_in, h_in) != (c, w, h):
@@ -288,7 +288,10 @@ class Factorized2d(Readout):
             x = shift_feature_maps(x, shift)
 
         feature_vecs = torch.einsum("bchw,nhw->bnc", x, self.spatial)
-            
+
+        if whitener is not None and whitener.mode == 'batch':
+            feature_vecs = whitener(feature_vecs)
+
         y = torch.einsum("bnc,nc->bn", feature_vecs, self.features)
         if self.bias is not None:
             y = y + self.bias

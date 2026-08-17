@@ -1,6 +1,7 @@
 import warnings
 
 import numpy as np
+import torch
 from torch import nn
 
 from .. import activations
@@ -19,7 +20,10 @@ class FiringRateEncoder(Encoder):
         modulator=None,
         elu_offset=0.0,
         nonlinearity_type="elu",
-        nonlinearity_config=None
+        nonlinearity_config=None,
+        variance_floor_weight=0.0,
+        variance_floor_gamma=1.0,
+        decov_weight=0.0,
     ):
         """
         An Encoder that wraps the core, readout and optionally a shifter amd modulator into one model.
@@ -32,6 +36,11 @@ class FiringRateEncoder(Encoder):
             modulator (optional[nn.ModuleDict]): Modulator network. Modulator networks are not implemented atm (24/06/2021). Defaults to None.
             nonlinearity (str): Non-linearity type to use. Defaults to 'elu'.
             nonlinearity_config (optional[dict]): Non-linearity configuration. Defaults to None.
+            variance_floor_weight (float): weight of a per-channel variance floor hinge loss on feature_vecs,
+                penalizing channels whose std falls below variance_floor_gamma. 0 disables it.
+            variance_floor_gamma (float): target minimum per-channel std for the variance floor loss.
+            decov_weight (float): weight of an off-diagonal covariance penalty (DeCov) on feature_vecs,
+                penalizing correlation between channels. 0 disables it.
         """
         super().__init__()
         self.core = core
@@ -41,6 +50,11 @@ class FiringRateEncoder(Encoder):
         self.shifter = shifter
         self.modulator = modulator
         self.offset = elu_offset
+        self.variance_floor_weight = variance_floor_weight
+        self.variance_floor_gamma = variance_floor_gamma
+        self.decov_weight = decov_weight
+        self.last_variance_floor_loss = 0.0
+        self.last_decov_loss = 0.0
 
         if nonlinearity_type != "elu" and not np.isclose(elu_offset, 0.0):
             warnings.warn("If `nonlinearity_type` is not 'elu', `elu_offset` will be ignored")
@@ -86,10 +100,31 @@ class FiringRateEncoder(Encoder):
         if self.shifter and pupil_center is not None and shift is None:
             shift = self.shifter[data_key](pupil_center, trial_idx)
 
-        x, feature_vecs = self.readout(x, data_key=data_key, shift=shift, **kwargs)
+        x, feature_vecs = self.readout(x, data_key=data_key, shift=shift, whitener=self.whitener, **kwargs)
 
-        if self.whitener and self.training:
+        if self.whitener and self.training and self.whitener.mode == 'ema':
             self.whitener.update(feature_vecs)
+
+        if self.training:
+            device = feature_vecs.device
+            self.last_variance_floor_loss = torch.zeros((), device=device)
+            self.last_decov_loss = torch.zeros((), device=device)
+
+            if self.variance_floor_weight > 0 or self.decov_weight > 0:
+                fv = feature_vecs.flatten(0, 1)
+                fv_centered = fv - fv.mean(dim=0, keepdim=True)
+                n, c = fv.shape
+                cov = fv_centered.T @ fv_centered / (n - 1)
+
+                if self.variance_floor_weight > 0:
+                    std = cov.diagonal().clamp_min(1e-12).sqrt()
+                    self.last_variance_floor_loss = self.variance_floor_weight * torch.relu(
+                        self.variance_floor_gamma - std
+                    ).mean()
+
+                if self.decov_weight > 0:
+                    off_diag_sq = cov.pow(2).sum() - cov.diagonal().pow(2).sum()
+                    self.last_decov_loss = self.decov_weight * off_diag_sq / (c * (c - 1))
 
         x = x[None, ...] if len(x.shape) == 1 else x  # keep dimensions if only one image was passed
 
