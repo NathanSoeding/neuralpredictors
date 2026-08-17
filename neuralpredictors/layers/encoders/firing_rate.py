@@ -18,6 +18,7 @@ class FiringRateEncoder(Encoder):
         shifter=None,
         modulator=None,
         elu_offset=0.0,
+        post_elu_ofset=1,
         nonlinearity_type="elu",
         nonlinearity_config=None
     ):
@@ -28,6 +29,7 @@ class FiringRateEncoder(Encoder):
             core (nn.Module): Core model. Refer to neuralpredictors.layers.cores
             readout (nn.ModuleDict): MultiReadout model. Refer to neuralpredictors.layers.readouts
             elu_offset (float): Offset value in the final elu non-linearity. Defaults to 0.
+            post_elu_ofset (float): Offset value added after the final elu non-linearity. Defaults to 1.
             shifter (optional[nn.ModuleDict]): Shifter network. Refer to neuralpredictors.layers.shifters. Defaults to None.
             modulator (optional[nn.ModuleDict]): Modulator network. Modulator networks are not implemented atm (24/06/2021). Defaults to None.
             nonlinearity (str): Non-linearity type to use. Defaults to 'elu'.
@@ -41,6 +43,7 @@ class FiringRateEncoder(Encoder):
         self.shifter = shifter
         self.modulator = modulator
         self.offset = elu_offset
+        self.post_elu_ofset = post_elu_ofset
 
         if nonlinearity_type != "elu" and not np.isclose(elu_offset, 0.0):
             warnings.warn("If `nonlinearity_type` is not 'elu', `elu_offset` will be ignored")
@@ -98,7 +101,7 @@ class FiringRateEncoder(Encoder):
             x = self.modulator[data_key](x, behavior=behavior)
 
         if self.nonlinearity_type == "elu":
-            return self.nonlinearity_fn(x + self.offset) + 1
+            return self.nonlinearity_fn(x + self.offset) + self.post_elu_ofset
         else:
             return self.nonlinearity_fn(x)
 
