@@ -55,6 +55,7 @@ class Factorized2d(Readout):
         regularizer_type="l1",
         gamma_sigma=0.1,
         source_grid=None,
+        retinotopy=True,
         spatial_init_noise=1.0,
         temperature=1.0,
         temp_per_neuron=False,
@@ -106,17 +107,21 @@ class Factorized2d(Readout):
         if self._entropy_reg:
             self.entropy_reg_weight = entropy_reg_weight
 
-        if source_grid is None:
-            raise ValueError("factorized readout needs source grid for retinotopy mapping")
-            
-        source_grid = source_grid - source_grid.mean(axis=0, keepdims=True)
-        source_grid = source_grid / np.abs(source_grid).max()
-        self.register_buffer("source_grid", torch.from_numpy(source_grid.astype(np.float32)))
+        if retinotopy and source_grid is None:
+            raise ValueError("retinotopy mapping is enabled which needs source grid")
+        
+        self._retinotopy = retinotopy
+        if self._retinotopy:
+            source_grid = source_grid - source_grid.mean(axis=0, keepdims=True)
+            source_grid = source_grid / np.abs(source_grid).max()
+            self.register_buffer("source_grid", torch.from_numpy(source_grid.astype(np.float32)))
 
-        in_dim = source_grid.shape[1]
-        self.spatial_w = nn.Parameter(torch.randn(in_dim, h, w) * spatial_init_noise)
-        self.spatial_b = nn.Parameter(torch.zeros((1, h, w)))
-    
+            in_dim = source_grid.shape[1]
+            self.spatial_w = nn.Parameter(torch.randn(in_dim, h, w) * spatial_init_noise)
+            self.spatial_b = nn.Parameter(torch.zeros((1, h, w)))
+        else:
+            self.raw_spatial = nn.Parameter(torch.randn(outdims, h, w) * spatial_init_noise)
+        
         if bias:
             bias = nn.Parameter(torch.Tensor(outdims))
             self.register_parameter("bias", bias)
@@ -253,12 +258,15 @@ class Factorized2d(Readout):
     
     @property
     def spatial(self):
-        rf = torch.einsum('nd,dhw->nhw', self.source_grid, self.spatial_w)
-        rf = rf + self.spatial_b
+        if self._retinotopy:
+            rf = torch.einsum('nd,dhw->nhw', self.source_grid, self.spatial_w)
+            rf = rf + self.spatial_b
+        else:
+            rf = self.raw_spatial
         
         kernel = self.gaussian_kernel(rf.device)
         rf = self.smooth(rf, kernel)
-        
+            
         n, h, w = rf.shape
         if self.temp_per_neuron:
             temp = self.log_temp.exp() + 1e-3
