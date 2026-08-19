@@ -614,7 +614,9 @@ class FullGaussian2d(Readout):
         feature_vecs = F.grid_sample(x, grid, align_corners=self.align_corners)
 
         if whitener is not None and whitener.mode == 'batch':
-            feature_vecs = whitener(feature_vecs.transpose(1, 2).squeeze(3)).unsqueeze(3).transpose(1, 2)
+            raw_feature_vecs = feature_vecs.transpose(1, 2).squeeze(3)
+            whitener.last_raw_feature_vecs = raw_feature_vecs
+            feature_vecs = whitener(raw_feature_vecs).unsqueeze(3).transpose(1, 2)
 
         y = (feature_vecs.squeeze(-1) * feat).sum(1).view(bs, outdims)
 

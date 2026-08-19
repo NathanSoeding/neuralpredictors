@@ -290,6 +290,7 @@ class Factorized2d(Readout):
         feature_vecs = torch.einsum("bchw,nhw->bnc", x, self.spatial)
 
         if whitener is not None and whitener.mode == 'batch':
+            whitener.last_raw_feature_vecs = feature_vecs
             feature_vecs = whitener(feature_vecs)
 
         y = torch.einsum("bnc,nc->bn", feature_vecs, self.features)

@@ -30,6 +30,7 @@ class Whitener(nn.Module):
         self.last_raw_max_abs_eigenvalue = None
 
         self._live_stats_mode = False
+        self.last_raw_feature_vecs = None
 
     @contextmanager
     def live_stats(self):

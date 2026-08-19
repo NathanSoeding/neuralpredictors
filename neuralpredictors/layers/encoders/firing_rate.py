@@ -24,6 +24,7 @@ class FiringRateEncoder(Encoder):
         variance_floor_weight=0.0,
         variance_floor_gamma=1.0,
         decov_weight=0.0,
+        decorrelation_on_raw_features=False,
     ):
         """
         An Encoder that wraps the core, readout and optionally a shifter amd modulator into one model.
@@ -41,6 +42,10 @@ class FiringRateEncoder(Encoder):
             variance_floor_gamma (float): target minimum per-channel std for the variance floor loss.
             decov_weight (float): weight of an off-diagonal covariance penalty (DeCov) on feature_vecs,
                 penalizing correlation between channels. 0 disables it.
+            decorrelation_on_raw_features (bool): when whitener.mode == 'batch', apply the variance
+                floor / DeCov penalties to the pre-whitening feature_vecs (the readout's raw sampled
+                core output) instead of the whitened ones. Has no effect if whitener is None or in
+                'ema' mode, since feature_vecs is already the raw features in that case.
         """
         super().__init__()
         self.core = core
@@ -53,6 +58,7 @@ class FiringRateEncoder(Encoder):
         self.variance_floor_weight = variance_floor_weight
         self.variance_floor_gamma = variance_floor_gamma
         self.decov_weight = decov_weight
+        self.decorrelation_on_raw_features = decorrelation_on_raw_features
         self.last_variance_floor_loss = 0.0
         self.last_decov_loss = 0.0
 
@@ -111,7 +117,15 @@ class FiringRateEncoder(Encoder):
             self.last_decov_loss = torch.zeros((), device=device)
 
             if self.variance_floor_weight > 0 or self.decov_weight > 0:
-                fv = feature_vecs.flatten(0, 1)
+                target_vecs = feature_vecs
+                if (
+                    self.decorrelation_on_raw_features
+                    and self.whitener is not None
+                    and self.whitener.mode == 'batch'
+                ):
+                    target_vecs = self.whitener.last_raw_feature_vecs
+
+                fv = target_vecs.flatten(0, 1)
                 fv_centered = fv - fv.mean(dim=0, keepdim=True)
                 n, c = fv.shape
                 cov = fv_centered.T @ fv_centered / (n - 1)
