@@ -567,7 +567,16 @@ class FullGaussian2d(Readout):
         self.register_buffer("grid_sharing_index", torch.from_numpy(sharing_idx))
         self._shared_grid = True
 
-    def forward(self, x: torch.Tensor, sample=None, shift=None, out_idx=None, whitener=None, **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        sample=None,
+        shift=None,
+        out_idx=None,
+        whitener=None,
+        external_whitened_feature_vecs=None,
+        **kwargs,
+    ) -> torch.Tensor:
         """
         Propagates the input forwards through the readout
         Args:
@@ -579,6 +588,11 @@ class FullGaussian2d(Readout):
                            if sample is True/False, overrides the model_state (i.e training or eval) and does as instructed
             shift (bool): shifts the location of the grid (from eye-tracking data)
             out_idx (bool): index of neurons to be predicted
+            external_whitened_feature_vecs: if given, (batch, outdims, c) feature vectors to use
+                directly for the final per-neuron combination below, skipping grid sampling and
+                any whitening here entirely. Used to finish a forward pass whose raw (pre-
+                whitening) feature vectors -- from a prior call with whitener=None -- were
+                whitened externally (e.g. jointly with other sessions' batches).
 
         Returns:
             y: neuronal activity
@@ -591,32 +605,43 @@ class FullGaussian2d(Readout):
         bias = self.bias
         outdims = self.outdims
 
-        if self.batch_sample:
-            # sample the grid_locations separately per image per batch
-            grid = self.sample_grid(batch_size=bs, sample=sample)  # sample determines sampling from Gaussian
+        if external_whitened_feature_vecs is not None:
+            if out_idx is not None:
+                if isinstance(out_idx, np.ndarray):
+                    if out_idx.dtype == bool:
+                        out_idx = np.where(out_idx)[0]
+                feat = feat[:, :, out_idx]
+                if bias is not None:
+                    bias = bias[out_idx]
+                outdims = len(out_idx)
+            feature_vecs = external_whitened_feature_vecs.unsqueeze(3).transpose(1, 2)
         else:
-            # use one sampled grid_locations for all images in the batch
-            grid = self.sample_grid(batch_size=1, sample=sample).expand(bs, outdims, 1, 2)
+            if self.batch_sample:
+                # sample the grid_locations separately per image per batch
+                grid = self.sample_grid(batch_size=bs, sample=sample)  # sample determines sampling from Gaussian
+            else:
+                # use one sampled grid_locations for all images in the batch
+                grid = self.sample_grid(batch_size=1, sample=sample).expand(bs, outdims, 1, 2)
 
-        if out_idx is not None:
-            if isinstance(out_idx, np.ndarray):
-                if out_idx.dtype == bool:
-                    out_idx = np.where(out_idx)[0]
-            feat = feat[:, :, out_idx]
-            grid = grid[:, out_idx]
-            if bias is not None:
-                bias = bias[out_idx]
-            outdims = len(out_idx)
+            if out_idx is not None:
+                if isinstance(out_idx, np.ndarray):
+                    if out_idx.dtype == bool:
+                        out_idx = np.where(out_idx)[0]
+                feat = feat[:, :, out_idx]
+                grid = grid[:, out_idx]
+                if bias is not None:
+                    bias = bias[out_idx]
+                outdims = len(out_idx)
 
-        if shift is not None:
-            grid = grid + shift[:, None, None, :]
+            if shift is not None:
+                grid = grid + shift[:, None, None, :]
 
-        feature_vecs = F.grid_sample(x, grid, align_corners=self.align_corners)
+            feature_vecs = F.grid_sample(x, grid, align_corners=self.align_corners)
 
-        if whitener is not None and whitener.mode == 'batch':
-            raw_feature_vecs = feature_vecs.transpose(1, 2).squeeze(3)
-            whitener.last_raw_feature_vecs = raw_feature_vecs
-            feature_vecs = whitener(raw_feature_vecs).unsqueeze(3).transpose(1, 2)
+            if whitener is not None and whitener.mode == 'batch':
+                raw_feature_vecs = feature_vecs.transpose(1, 2).squeeze(3)
+                whitener.last_raw_feature_vecs = raw_feature_vecs
+                feature_vecs = whitener(raw_feature_vecs).unsqueeze(3).transpose(1, 2)
 
         y = (feature_vecs.squeeze(-1) * feat).sum(1).view(bs, outdims)
 

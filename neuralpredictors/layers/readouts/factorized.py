@@ -278,20 +278,23 @@ class Factorized2d(Readout):
         else:
             return self._features
 
-    def forward(self, x, shift=None, whitener=None, **kwargs):
+    def forward(self, x, shift=None, whitener=None, external_whitened_feature_vecs=None, **kwargs):
         c, h, w = x.size()[1:]
         c_in, h_in, w_in = self.in_shape
         if (c_in, w_in, h_in) != (c, w, h):
             raise ValueError("the specified feature map dimension is not the readout's expected input dimension")
 
-        if shift is not None:
-            x = shift_feature_maps(x, shift)
+        if external_whitened_feature_vecs is not None:
+            feature_vecs = external_whitened_feature_vecs
+        else:
+            if shift is not None:
+                x = shift_feature_maps(x, shift)
 
-        feature_vecs = torch.einsum("bchw,nhw->bnc", x, self.spatial)
+            feature_vecs = torch.einsum("bchw,nhw->bnc", x, self.spatial)
 
-        if whitener is not None and whitener.mode == 'batch':
-            whitener.last_raw_feature_vecs = feature_vecs
-            feature_vecs = whitener(feature_vecs)
+            if whitener is not None and whitener.mode == 'batch':
+                whitener.last_raw_feature_vecs = feature_vecs
+                feature_vecs = whitener(feature_vecs)
 
         y = torch.einsum("bnc,nc->bn", feature_vecs, self.features)
         if self.bias is not None:

@@ -88,6 +88,30 @@ class LongCycler:
         return len(self.loaders) * self.max_batches
 
 
+class JointCycler:
+    """
+    Given a dictionary mapping data_key to dataloader, yields one joint step per iteration:
+    a list of (data_key, batch) pairs, one drawn from *every* loader at once, advancing all
+    loaders together (looping the shorter ones via `cycle`). Needed whenever a training step
+    must see all sessions simultaneously (e.g. to pool a statistic such as a covariance across
+    sessions in a single forward/backward pass), as opposed to LongCycler/ShortCycler, which
+    yield one session's batch per step.
+    """
+
+    def __init__(self, loaders):
+        self.loaders = loaders
+        self.max_batches = max([len(loader) for loader in self.loaders.values()])
+
+    def __iter__(self):
+        keys = list(self.loaders.keys())
+        cycles = [cycle(self.loaders[k]) for k in keys]
+        for _ in range(self.max_batches):
+            yield [(k, next(c)) for k, c in zip(keys, cycles)]
+
+    def __len__(self):
+        return self.max_batches
+
+
 class ShortCycler:
     """
     Cycles through trainloaders until the loader with smallest size is exhausted.

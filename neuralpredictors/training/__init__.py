@@ -9,6 +9,6 @@ This includes:
 """
 
 from .context_managers import device_state, eval_state
-from .cyclers import Exhauster, LongCycler, ShortCycler
+from .cyclers import Exhauster, JointCycler, LongCycler, ShortCycler
 from .early_stopping import early_stopping
 from .tracking import MultipleObjectiveTracker, TimeObjectiveTracker

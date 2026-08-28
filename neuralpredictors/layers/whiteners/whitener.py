@@ -118,6 +118,34 @@ class Whitener(nn.Module):
     def whiten(self, x):
         return self._whiten_with(x, self.mu_ema, self.cov_ema)
 
+    def joint_whiten_batch(self, raw_feature_vecs_list):
+        """
+        Whitens a list of per-session raw feature vectors (each (batch_i, neurons_i, model_dim))
+        as a single pooled batch: mean/covariance are computed fresh from all of them
+        concatenated together -- no EMA, no multi-step window (unlike forward()'s batch-mode
+        pooling, which mixes in a detached history from previous calls) -- so gradients from the
+        returned whitened vectors flow through every session via the shared mean/covariance.
+        Also updates mu_ema/cov_ema and the usual diagnostics from these pooled statistics, so
+        eval-time whitening (which reads mu_ema/cov_ema) and wandb diagnostics stay meaningful.
+        Only valid when self.mode == 'batch'.
+        """
+        assert self.mode == "batch", "joint_whiten_batch only applies in 'batch' mode"
+
+        pooled = torch.cat([rv.flatten(0, 1) for rv in raw_feature_vecs_list], dim=0)  # (N, c)
+
+        if self.training:
+            self.update(pooled.unsqueeze(0))
+
+        mu = pooled.mean(dim=0, keepdim=True)
+        cov = (pooled - mu).T @ (pooled - mu) / (pooled.shape[0] - 1)
+
+        whitened = [self._whiten_with(rv, mu, cov) for rv in raw_feature_vecs_list]
+
+        pooled_whitened = torch.cat([w.flatten(0, 1) for w in whitened], dim=0).unsqueeze(0)
+        self._update_diagnostics(pooled_whitened, cov)
+
+        return whitened
+
     def transform_weights(self, w):
         eye = torch.eye(self.cov_ema.shape[0], dtype=self.cov_ema.dtype, device=self.cov_ema.device)
         L = torch.linalg.cholesky(self.cov_ema + self.eps * eye)
