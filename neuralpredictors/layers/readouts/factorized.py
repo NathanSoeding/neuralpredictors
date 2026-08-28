@@ -95,10 +95,15 @@ class Factorized2d(Readout):
 
         self.kernel_size = kernel_size
         self._smoothness_reg = smoothness_reg_weight > 0.0
+        self._smooth_spatial = kernel_sigma > 0.0
+        assert (
+            (not self._smoothness_reg) or self._smooth_spatial, 
+            "If smoothness_reg is enabled kenel_sigma can't be zero"
+        )
         if self._smoothness_reg:
             self.smoothness_reg_weight = smoothness_reg_weight
             self.kernel_sigma = nn.Parameter(torch.tensor(float(kernel_sigma)))
-        else:
+        elif self._smooth_spatial:
             self.kernel_sigma = kernel_sigma
             # sigma is fixed -> kernel is fixed -> build it once instead of every forward
             self.register_buffer("_fixed_kernel", self._build_gaussian_kernel(self.kernel_sigma))
@@ -264,8 +269,9 @@ class Factorized2d(Readout):
         else:
             rf = self.raw_spatial
         
-        kernel = self.gaussian_kernel(rf.device)
-        rf = self.smooth(rf, kernel)
+        if self._smooth_spatial:
+            kernel = self.gaussian_kernel(rf.device)
+            rf = self.smooth(rf, kernel)
             
         n, h, w = rf.shape
         if self.temp_per_neuron:
