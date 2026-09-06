@@ -355,7 +355,7 @@ class RotationEquivariant2dCore(Stacked2dCore, nn.Module):
             padding=self.input_kern // 2 if self.pad_input else 0,
             first_layer=True,
         )
-        self.add_bn_layer(layer, 0)
+        self.add_bn_layer(layer, 0, self.track_running_stats)
         self.add_activation(layer)
         self.features.add_module("layer0", nn.Sequential(layer))
 
@@ -379,7 +379,7 @@ class RotationEquivariant2dCore(Stacked2dCore, nn.Module):
                 padding=self.hidden_padding,
                 first_layer=False,
             )
-            self.add_bn_layer(layer, l)
+            self.add_bn_layer(layer, l, self.track_running_stats)
             self.add_activation(layer)
             self.features.add_module(f"layer{l}", nn.Sequential(layer))
 
