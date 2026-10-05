@@ -41,7 +41,7 @@ def shift_feature_maps(x, shifts):
     )
 
 
-class Factorized2d(Readout):
+class RetinotopicFactorizedLinear2d(Readout):
     def __init__(
         self,
         in_shape,  # channels, height, width
@@ -309,7 +309,7 @@ class Factorized2d(Readout):
         return y, feature_vecs
 
 
-class LegacyFullFactorized2d(Readout):
+class FullFactorized2d(Readout):
     """
     Factorized fully connected layer. Weights are a sum of outer products between a spatial filter and a feature vector.
     """
@@ -512,9 +512,9 @@ class LegacyFullFactorized2d(Readout):
 
 
 # Classes for backwards compatibility
-class SpatialXFeatureLinear(LegacyFullFactorized2d):
+class SpatialXFeatureLinear(FullFactorized2d):
     pass
 
 
-class FullSXF(LegacyFullFactorized2d):
+class FullSXF(FullFactorized2d):
     pass
