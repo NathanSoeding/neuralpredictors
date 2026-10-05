@@ -11,6 +11,7 @@ class FiringRateEncoder(Encoder):
     def __init__(
         self,
         core,
+        whitener,
         readout,
         *,
         perspective=None,
@@ -34,6 +35,7 @@ class FiringRateEncoder(Encoder):
         """
         super().__init__()
         self.core = core
+        self.whitener = whitener
         self.readout = readout
         self.perspective = perspective
         self.shifter = shifter
@@ -63,6 +65,7 @@ class FiringRateEncoder(Encoder):
         trial_idx=None,
         shift=None,
         detach_core=False,
+        return_vec=False,
         **kwargs
     ):
         x = inputs
@@ -80,13 +83,14 @@ class FiringRateEncoder(Encoder):
         if detach_core:
             x = x.detach()
 
-        if self.shifter and shift is None:
-            # if shift is defined - no need to change it
-            if pupil_center is None:
-                raise ValueError("pupil_center is not given")
+        if self.shifter and pupil_center is not None and shift is None:
             shift = self.shifter[data_key](pupil_center, trial_idx)
 
-        x = self.readout(x, data_key=data_key, shift=shift, **kwargs)
+        x, feature_vecs = self.readout(x, data_key=data_key, shift=shift, **kwargs)
+
+        if self.whitener and self.training:
+            self.whitener.update(feature_vecs)
+
         x = x[None, ...] if len(x.shape) == 1 else x  # keep dimensions if only one image was passed
 
         if self.modulator:
@@ -95,9 +99,15 @@ class FiringRateEncoder(Encoder):
             x = self.modulator[data_key](x, behavior=behavior)
 
         if self.nonlinearity_type == "elu":
-            return self.nonlinearity_fn(x + self.offset) + 1
+            if return_vec:
+                return self.nonlinearity_fn(x + self.offset) + 1, feature_vecs
+            else: 
+                return self.nonlinearity_fn(x + self.offset) + 1
         else:
-            return self.nonlinearity_fn(x)
+            if return_vec:
+                return self.nonlinearity_fn(x), feature_vecs
+            else:
+                return self.nonlinearity_fn(x)
 
     def predict_mean(self, x, *args, data_key=None, **kwargs):
         return self.forward(x, *args, data_key=data_key, **kwargs)
